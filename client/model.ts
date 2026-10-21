@@ -23,6 +23,7 @@ const detail = z.discriminatedUnion("kind", [
 ]);
 
 export const toolSchema = z.object({
+  disclosureKey: z.string().optional(),
   status: z.enum(["running", "completed", "failed", "canceled"]),
   icon: z.string(),
   verb: z.string(),
@@ -298,18 +299,18 @@ export function toolData(item: Item<"tool_call">): ToolData {
     item.name === "task_notification" && item.detail.type === "plain_text"
       ? { icon: "Bell", verb: "Background task", target: item.detail.label, mono: false }
       : describe(item.detail, item.name, item.status === "running");
-  if (item.status === "canceled") return { ...base, status: "canceled", icon: "CircleSlash", verb: "Canceled", meta: undefined };
+  if (item.status === "canceled") return { ...base, disclosureKey: item.callId, status: "canceled", icon: "CircleSlash", verb: "Canceled", meta: undefined };
   if (item.status === "failed") {
     const body = errorBody(item.error) ?? "";
     // Claude reports shell failures as "Exit code N" followed by the output: show it as exit N + output.
     const exit = item.detail.type === "shell" ? /^Exit code (\d+)\s*([\s\S]*)$/.exec(body.trim()) : null;
     if (exit && base.detail?.kind === "output") {
       const detail = base.detail.text ? base.detail : { ...base.detail, text: clipLines(exit[2] ?? "") };
-      return { ...base, status: "failed", meta: `exit ${exit[1]}`, metaTone: "danger", detail };
+      return { ...base, disclosureKey: item.callId, status: "failed", meta: `exit ${exit[1]}`, metaTone: "danger", detail };
     }
-    return { ...base, status: "failed", meta: base.meta ?? "failed", metaTone: "danger", error: errorText(item.error) };
+    return { ...base, disclosureKey: item.callId, status: "failed", meta: base.meta ?? "failed", metaTone: "danger", error: errorText(item.error) };
   }
-  return { ...base, status: item.status };
+  return { ...base, disclosureKey: item.callId, status: item.status };
 }
 
 /** Which "Show in timeline" switch covers a tool call; running and failed calls are never hidden. */

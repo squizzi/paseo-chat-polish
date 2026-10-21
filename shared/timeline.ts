@@ -61,6 +61,8 @@ export const prefsSchema = z.object({
   loaderSize: z.enum(["s", "m", "l"]).default("s"),
   /** Paseo's own items (tool call groups, bubbles, markdown) restyled to the design on desktop, or left as Paseo draws them. */
   nativeStyle: z.enum(["design", "paseo"]).default("design"),
+  /** Chat Polish motion for message entrances, streaming text, tool disclosures and loaded images. */
+  motion: z.boolean().default(true),
   /** A recap row the daemon adds after each turn that changed files or had a failing command. */
   recap: z.enum(["on", "off"]).default("on"),
   /** Mermaid diagrams in Paseo's own replies drawn by Pele (pele.run) in the theme's colors, or by Paseo's mermaid (desktop and web, with nativeStyle "design"). */
