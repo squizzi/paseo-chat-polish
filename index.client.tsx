@@ -3,6 +3,7 @@ import type { PluginClientContext, PluginSidebarItemProps } from "@getpaseo/plug
 import { copyText, useToast, type ToastApi } from "@getpaseo/plugin/client/react-native";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { useEffect } from "react";
+import { z } from "zod";
 import { Dashboard } from "./client/dashboard";
 import { clearImageCache } from "./client/images";
 import { sidebarIcon } from "./client/mark";
@@ -11,10 +12,11 @@ import { followAgent, isTodo, onStaleSteps, onUnplacedStep, placeStep, resetMade
 import { renderDiagram } from "./shared/diagram";
 import { currentPrefs, savePrefs, setPrefs, subscribePrefs, usePrefsSaver } from "./client/prefs";
 import { bindThemeRegistry, currentTheme, registerTheme } from "./client/theme-registry";
-import { addIconSet, bindPromptKeys, clampUserMessages, iconTwins, jumpToPrompt, openAgentIds, paintSidebar, redrawDiagrams, setCompactHandler, readHostAppearance, restyleNative, selectionCopyMenu, setNativeColors, setRailProviders, setRichText, stylePluginViews, nativeIconSet, watchDom } from "./client/web";
+import { addIconSet, bindPromptKeys, clampUserMessages, iconTwins, jumpToPrompt, openAgentIds, paintSidebar, redrawDiagrams, setCompactHandler, readHostAppearance, restyleNative, selectionCopyMenu, setNativeColors, setRailProviders, setRichText, smoothStreamingText, stylePluginViews, nativeIconSet, watchDom } from "./client/web";
 import { getTheme, THEME_CATALOG_ID, themeSchema } from "./shared/theme";
 import { getIconSet, getPrefs, type Prefs } from "./shared/timeline";
 import { HtmlItem, ImagesItem, NoticeItem, PlanItem, RecapItem, StepsItem, ThoughtItem, TodoItem, ToolItem } from "./client/views";
+import { StreamingAssistant } from "./client/streaming-markdown";
 import { htmlData, htmlSchema } from "./client/html";
 import { recapSchema } from "./shared/recap";
 
@@ -54,6 +56,7 @@ export default function contribute(client: PluginClientContext) {
   const unclamp = clampUserMessages(() => currentPrefs().userMessages === "clamp");
   const unselect = selectionCopyMenu(() => currentPrefs().selectionCopy === "on");
   const unicons = nativeIconSet(() => currentPrefs().iconSet);
+  const unsmoothText = smoothStreamingText(() => currentPrefs().motion, subscribePrefs);
 
   // The composer's model selector rail lists every provider, which Paseo only renders for new chats.
   const loadProviders = () =>
@@ -109,6 +112,13 @@ export default function contribute(client: PluginClientContext) {
   const addTransformers = () => {
     const removers = [
       client.addTimelineTransformer({
+        id: `${KIND}-streaming-assistant`,
+        query: { itemType: "assistant_message" },
+        transform: ({ item, phase }) => phase === "streaming" && currentPrefs().motion
+          ? one("streaming-assistant", { text: item.text })
+          : undefined,
+      }),
+      client.addTimelineTransformer({
         id: `${KIND}-tool`,
         query: { itemType: "tool_call" },
         transform: ({ item, phase }) => {
@@ -153,7 +163,7 @@ export default function contribute(client: PluginClientContext) {
     return () => removers.forEach((r) => void r());
   };
   let removeTransformers = addTransformers();
-  const inputs = () => [currentPrefs().images, currentPrefs().hidden.join(), currentPrefs().merge, readHostAppearance().toolCallDetail].join("|");
+  const inputs = () => [currentPrefs().images, currentPrefs().hidden.join(), currentPrefs().merge, currentPrefs().motion, readHostAppearance().toolCallDetail].join("|");
   let transformedWith = inputs();
   const retransform = (force = false) => {
     if (!force && inputs() === transformedWith) return;
@@ -190,7 +200,7 @@ export default function contribute(client: PluginClientContext) {
     });
   });
   // Prefs Paseo's own rows follow too reach the restyle as <html> attributes.
-  const markRoot = (p: Prefs) => setRichText({ ...p.richText, images: p.images, steps: p.steps, density: p.density === "normal" ? "a" : p.density, "icon-steps": p.rowIcons.steps === "hide" ? "hide" : "a", "icon-tool": p.rowIcons.tool === "hide" ? "hide" : "a", loader: p.loader === "dots" ? "a" : p.loader, "loader-size": p.loaderSize === "s" ? "a" : p.loaderSize, icons: p.iconSet === "lucide" ? "a" : p.iconSet });
+  const markRoot = (p: Prefs) => setRichText({ ...p.richText, images: p.images, steps: p.steps, density: p.density === "normal" ? "a" : p.density, "icon-steps": p.rowIcons.steps === "hide" ? "hide" : "a", "icon-tool": p.rowIcons.tool === "hide" ? "hide" : "a", loader: p.loader === "dots" ? "a" : p.loader, "loader-size": p.loaderSize === "s" ? "a" : p.loaderSize, icons: p.iconSet === "lucide" ? "a" : p.iconSet, motion: p.motion ? "a" : "off" });
   markRoot(currentPrefs());
   // The chosen icon set comes from the daemon once, the first time it's picked.
   const requestedIcons = new Set<string>();
@@ -243,6 +253,7 @@ export default function contribute(client: PluginClientContext) {
   client.addTimelineRenderer({ kind: `${KIND}-steps`, version: 1, schema: stepsSchema, Component: StepsItem });
   client.addTimelineRenderer({ kind: `${KIND}-recap`, version: 1, schema: recapSchema, Component: RecapItem });
   client.addTimelineRenderer({ kind: `${KIND}-html`, version: 1, schema: htmlSchema, Component: HtmlItem });
+  client.addTimelineRenderer({ kind: `${KIND}-streaming-assistant`, version: 1, schema: z.object({ text: z.string() }), Component: StreamingAssistant });
 
   const unbindPromptKeys = bindPromptKeys();
   for (const [id, title, direction] of [["previous-prompt", "Previous prompt", -1], ["next-prompt", "Next prompt", 1]] as const) {
@@ -312,6 +323,7 @@ export default function contribute(client: PluginClientContext) {
     unclamp();
     unselect();
     unicons();
+    unsmoothText();
     unsubscribeProviders();
     unrestyle();
     unstylePluginViews();

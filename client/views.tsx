@@ -15,8 +15,9 @@ import { contrast, isHex } from "../shared/theme";
 import { highlight, highlightShell, highlightShellBlock, SYNTAX_THEMES, type Span, type SyntaxColors } from "./highlight";
 import { Icon } from "./icons";
 import { usePrefs } from "./prefs";
+import { recallDisclosure, rememberDisclosure } from "./disclosure-state";
 import { useCurrentTheme } from "./theme-registry";
-import { followExpansionAtBottom, readHostAppearance, type HostAppearance } from "./web";
+import { followExpansionAtBottom, readHostAppearance, TOOL_DISCLOSURE_MS, type HostAppearance } from "./web";
 import type { HtmlData } from "./html";
 import { HtmlFrame, lastFrameHeight, useHovered, useHtmlTheme, windowButtonsInset } from "./html-frame";
 import { htmlPage } from "../shared/page";
@@ -27,6 +28,7 @@ const SQUIRCLE_CARD = { dataSet: { cpSquircle: "card" } } as object;
 const ROW_HOVER = { dataSet: { cpRow: "" } } as object;
 const RUNNING_LABEL = { dataSet: { cpRunningLabel: "" } } as object;
 const NO_WRAP_SCROLL = { dataSet: { cpNowrap: "" } } as object;
+const IMAGE_ARRIVAL = { dataSet: { cpImageArrival: "" } } as object;
 
 // Paseo's own fallback stack when Settings → Appearance → Code font is empty.
 const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" });
@@ -203,15 +205,27 @@ function useEnter(live: boolean) {
 }
 
 /** Open state whose toggle animates the surrounding layout change. */
-function useDisclosure(initial = false) {
-  const [open, setOpen] = useState(initial);
+function useDisclosure(initial = false, key?: string) {
+  const saved = useRef(recallDisclosure(key, initial)).current;
+  const [open, setOpenState] = useState(saved.open);
   const reduced = useReducedMotion();
+  const motion = usePrefs().motion;
+  const setOpen = useCallback((value: boolean | ((previous: boolean) => boolean)) => {
+    setOpenState((previous) => {
+      const next = typeof value === "function" ? value(previous) : value;
+      rememberDisclosure(key, next);
+      return next;
+    });
+  }, [key]);
+  // Record defaults too: an automatically expanded detail should restore
+  // silently if its tab is revisited, even when nobody toggled it yet.
+  useEffect(() => { rememberDisclosure(key, open); }, [key, open]);
   const toggle = useCallback(() => {
-    followExpansionAtBottom();
+    followExpansionAtBottom(motion);
     if (!reduced && Platform.OS !== "web") LayoutAnimation.configureNext(LayoutAnimation.create(100, "easeOut", "opacity"));
     setOpen((v) => !v);
-  }, [reduced]);
-  return [open, toggle, setOpen] as const;
+  }, [motion, reduced, setOpen]);
+  return [open, toggle, setOpen, saved.restored] as const;
 }
 
 function FadeIn({ children, style }: { children: ReactNode; style?: StyleProp<ViewStyle> }) {
@@ -220,8 +234,9 @@ function FadeIn({ children, style }: { children: ReactNode; style?: StyleProp<Vi
 }
 
 /** Keep output only through the closing transition; reopening cancels its pending removal. */
-function Expand({ open, children, style }: { open: boolean; children: ReactNode | (() => ReactNode); style?: StyleProp<ViewStyle> }) {
+function Expand({ open, restored = false, children, style }: { open: boolean; restored?: boolean; children: ReactNode | (() => ReactNode); style?: StyleProp<ViewStyle> }) {
   const reduced = useReducedMotion();
+  const motion = usePrefs().motion;
   const [present, setPresent] = useState(open);
   useEffect(() => {
     if (open) {
@@ -233,15 +248,15 @@ function Expand({ open, children, style }: { open: boolean; children: ReactNode 
       setPresent(false);
       return;
     }
-    // Leave a small buffer beyond the 100ms CSS transition before releasing the content.
-    const timer = setTimeout(() => setPresent(false), 130);
+    // Leave a small buffer beyond the CSS transition before releasing the content.
+    const timer = setTimeout(() => setPresent(false), motion ? TOOL_DISCLOSURE_MS + 30 : 130);
     return () => clearTimeout(timer);
-  }, [open, present, reduced]);
+  }, [motion, open, present, reduced]);
   if (!open && (!present || reduced || Platform.OS !== "web")) return null;
   const content = typeof children === "function" ? children() : children;
   if (Platform.OS !== "web") return <FadeIn style={style}>{content}</FadeIn>;
   return (
-    <View {...({ dataSet: { cpExpand: open ? "open" : "closed" } } as object)} accessibilityElementsHidden={!open}>
+    <View {...({ dataSet: { cpExpand: open ? "open" : "closed", cpExpandRestored: restored ? "" : undefined } } as object)} accessibilityElementsHidden={!open}>
       <View style={{ minHeight: 0, overflow: "hidden" }}>
         <View style={style}>{content}</View>
       </View>
@@ -508,16 +523,16 @@ function ToolDetail({ data, theme }: { data: NonNullable<ToolData["detail"]>; th
 /** Rows inside an open merged run sit flush in its list, without the timeline spacing TIGHT adds. */
 type Nestable = { nested?: boolean };
 
-export function ToolItem({ item, theme, layout, nested }: PluginTimelineItemProps<ToolData> & Nestable) {
+export function ToolItem({ item, theme, layout, nested, agentId }: PluginTimelineItemProps<ToolData> & Nestable) {
   const d = item.data;
   const s = useStyles(theme);
   const { toolDetails, density } = usePrefs();
   const auto = !!d.detail && (toolDetails === "expanded" || (toolDetails === "failed" && d.status === "failed"));
-  const [open, toggle, setOpen] = useDisclosure(auto);
+  const [open, toggle, setOpen, restored] = useDisclosure(auto, d.disclosureKey ? `tool:${agentId}:${d.disclosureKey}` : undefined);
   // A running call that fails opens once it fails.
   useEffect(() => {
-    if (auto) setOpen(true);
-  }, [auto, setOpen]);
+    if (auto && !restored) setOpen(true);
+  }, [auto, restored, setOpen]);
   const enter = useEnter(d.status === "running");
   const indent = useIndent("tool");
   const c = theme.colors;
@@ -546,7 +561,7 @@ export function ToolItem({ item, theme, layout, nested }: PluginTimelineItemProp
         </Text>
       ) : null}
       {d.detail ? (
-        <Expand open={open} style={[s.detail, { paddingLeft: indent, marginBottom: 12 }]}>
+        <Expand open={open} restored={restored} style={[s.detail, { paddingLeft: indent, marginBottom: 12 }]}>
           <ToolDetail data={d.detail} theme={theme} />
         </Expand>
       ) : null}
@@ -567,16 +582,16 @@ export function StepsItem(props: PluginTimelineItemProps<z.output<typeof stepsSc
   useSyncExternalStore(subscribe, () => runVersion(head));
   const { steps, ms, open: tail } = runOf(head);
   const working = useAgent(props.agentId, (a) => a.status === "running") ?? false;
-  return <MergedSteps {...props} steps={steps} ms={ms} growing={!!tail && working} />;
+  return <MergedSteps {...props} steps={steps} ms={ms} growing={!!tail && working} disclosureKey={`steps:${props.agentId}:${head}`} />;
 }
 
 /** The merged row. Done, it says what the run did and how long it took; working, it names the step in progress; a failed step turns
  * the icon red. Open, it lists the steps as their own rows. A lone step renders as itself. The dashboard preview draws it from samples. */
 export function MergedSteps(
-  props: PluginTimelineItemProps<unknown> & { steps: Array<{ item: AgentTimelineItem; phase: "streaming" | "complete" }>; ms?: number; growing: boolean; defaultOpen?: boolean },
+  props: PluginTimelineItemProps<unknown> & { steps: Array<{ item: AgentTimelineItem; phase: "streaming" | "complete" }>; ms?: number; growing: boolean; defaultOpen?: boolean; disclosureKey?: string },
 ) {
   const { item, theme, layout, steps, ms, growing, defaultOpen } = props;
-  const [open, toggle] = useDisclosure(!!defaultOpen);
+  const [open, toggle, , restored] = useDisclosure(!!defaultOpen, props.disclosureKey);
   const icons = !!useIndent("steps");
   const { density } = usePrefs();
   // Inside the open list steps sit flush; a run of one stands in the timeline like any row.
@@ -621,7 +636,7 @@ export function MergedSteps(
         open={open}
         onToggle={toggle}
       />
-      <Expand open={open} style={{ marginLeft: icons ? 9 : 0, paddingLeft: icons ? 15 : 13, paddingTop: 3, paddingBottom: 3, borderLeftWidth: 1, borderLeftColor: alpha(c.border, 0.6) }}>{() => steps.map((s) => step(s))}</Expand>
+      <Expand open={open} restored={restored} style={{ marginLeft: icons ? 9 : 0, paddingLeft: icons ? 15 : 13, paddingTop: 3, paddingBottom: 3, borderLeftWidth: 1, borderLeftColor: alpha(c.border, 0.6) }}>{() => steps.map((s) => step(s))}</Expand>
     </View>
   );
 }
@@ -853,7 +868,8 @@ function Thumbnail({ alt, url, theme, onOpen }: { alt: string; url: string; them
   const s = useStyles(theme);
   const c = theme.colors;
   const { uri, failed } = useImage(url, "thumbnail");
-  const size = THUMB[usePrefs().images === "large" ? "large" : "small"];
+  const prefs = usePrefs();
+  const size = THUMB[prefs.images === "large" ? "large" : "small"];
   const frame = [size, { borderRadius: 8, borderWidth: StyleSheet.hairlineWidth, borderColor: c.border, backgroundColor: c.surface1, overflow: "hidden" as const }];
   if (!uri) {
     return (
@@ -864,7 +880,7 @@ function Thumbnail({ alt, url, theme, onOpen }: { alt: string; url: string; them
     );
   }
   return (
-    <Pressable accessibilityRole="imagebutton" accessibilityLabel={`Open ${alt}`} onPress={onOpen} style={frame}>
+    <Pressable {...(prefs.motion ? IMAGE_ARRIVAL : {})} accessibilityRole="imagebutton" accessibilityLabel={`Open ${alt}`} onPress={onOpen} style={frame}>
       <Image source={{ uri }} style={size} resizeMode="cover" />
     </Pressable>
   );
@@ -1054,38 +1070,36 @@ export function RecapItem({ item, theme }: PluginTimelineItemProps<Recap>) {
         {parts.flatMap((part, i) => (i ? [<Text key={`dot${i}`} style={text}>·</Text>, part] : [part]))}
         <Icon name={open ? "ChevronDown" : "ChevronRight"} size={12} color={c.foregroundMuted} />
       </Pressable>
-      {open ? (
-        <FadeIn style={{ paddingLeft: 9, marginTop: 4 }}>
-          <View style={{ borderLeftWidth: 1, borderLeftColor: alpha(c.border, 0.6), paddingLeft: 14, paddingVertical: 2 }}>
-            {files.map((f) => {
-              const cut = f.path.lastIndexOf("/") + 1;
-              return (
-                <View key={f.path} style={{ flexDirection: "row", alignItems: "center", gap: 10, minHeight: 26 }}>
-                  <Text {...PMONO} numberOfLines={1} ellipsizeMode="head" style={[mono, { flexShrink: 1 }]} selectable>
-                    <Text style={{ color: c.foregroundMuted }}>{f.path.slice(0, cut)}</Text>
-                    {f.path.slice(cut)}
-                  </Text>
-                  <View style={{ flex: 1 }} />
-                  <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: 6, minWidth: 76 }}>
-                    {f.added ? <Text {...PMONO} style={[mono, { color: c.statusSuccess }]}>+{f.added}</Text> : null}
-                    {f.removed ? <Text {...PMONO} style={[mono, { color: c.statusDanger }]}>−{f.removed}</Text> : null}
-                  </View>
-                  <Diffstat added={f.added} removed={f.removed} theme={theme} />
-                </View>
-              );
-            })}
-            {failed.map((f, i) => (
-              <View key={i} style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: 26 }}>
-                {dot}
-                <Text {...PMONO} numberOfLines={1} style={[mono, { flexShrink: 1 }]} selectable>
-                  {f.command}
+      <Expand open={open} style={{ paddingLeft: 9, marginTop: 4 }}>
+        <View style={{ borderLeftWidth: 1, borderLeftColor: alpha(c.border, 0.6), paddingLeft: 14, paddingVertical: 2 }}>
+          {files.map((f) => {
+            const cut = f.path.lastIndexOf("/") + 1;
+            return (
+              <View key={f.path} style={{ flexDirection: "row", alignItems: "center", gap: 10, minHeight: 26 }}>
+                <Text {...PMONO} numberOfLines={1} ellipsizeMode="head" style={[mono, { flexShrink: 1 }]} selectable>
+                  <Text style={{ color: c.foregroundMuted }}>{f.path.slice(0, cut)}</Text>
+                  {f.path.slice(cut)}
                 </Text>
-                {f.exit ? <Text {...PMONO} numberOfLines={1} style={[mono, { flexShrink: 0, color: c.statusDanger }]}>exit {f.exit}</Text> : null}
+                <View style={{ flex: 1 }} />
+                <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: 6, minWidth: 76 }}>
+                  {f.added ? <Text {...PMONO} style={[mono, { color: c.statusSuccess }]}>+{f.added}</Text> : null}
+                  {f.removed ? <Text {...PMONO} style={[mono, { color: c.statusDanger }]}>−{f.removed}</Text> : null}
+                </View>
+                <Diffstat added={f.added} removed={f.removed} theme={theme} />
               </View>
-            ))}
-          </View>
-        </FadeIn>
-      ) : null}
+            );
+          })}
+          {failed.map((f, i) => (
+            <View key={i} style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: 26 }}>
+              {dot}
+              <Text {...PMONO} numberOfLines={1} style={[mono, { flexShrink: 1 }]} selectable>
+                {f.command}
+              </Text>
+              {f.exit ? <Text {...PMONO} numberOfLines={1} style={[mono, { flexShrink: 0, color: c.statusDanger }]}>exit {f.exit}</Text> : null}
+            </View>
+          ))}
+        </View>
+      </Expand>
     </View>
   );
 }

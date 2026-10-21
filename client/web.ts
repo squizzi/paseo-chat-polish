@@ -1,6 +1,9 @@
 import { Platform } from "react-native";
 import { BOT_ICON, PROVIDER_ICONS } from "./provider-icons";
 import { guardPositional, POSITIONAL, splitTop } from "./css-guard";
+import { shouldQueueMessageEntrance } from "./message-entry-motion";
+import { CHAT_MARKDOWN_DENSITY, CHAT_MARKDOWN_LINE_HEIGHT } from "./chat-markdown-style";
+import { STREAM_TOKEN_FADE_MS, STREAM_TOKEN_PREROLL_MS } from "./streaming-token-motion";
 
 declare const localStorage: { getItem(key: string): string | null; setItem(key: string, value: string): void };
 declare const location: { reload(): void };
@@ -33,13 +36,26 @@ interface DomElement {
   outerHTML: string;
   scrollTop: number;
   clientHeight: number;
+  clientWidth: number;
   scrollBy(options: { top: number }): void;
   appendChild(el: DomElement): void;
   insertAdjacentElement(where: "afterend" | "beforeend", el: DomElement): void;
   insertAdjacentHTML(where: "beforeend", html: string): void;
   click(): void;
   cloneNode(deep: true): DomElement;
+  animate?(frames: Array<Record<string, string | number>>, options: { duration: number; delay?: number; easing: string; fill: "both" }): DomAnimation;
   getBoundingClientRect(): { top: number; left: number; right: number; bottom: number; width: number; height: number };
+}
+interface DomAnimation {
+  cancel(): void;
+  finished: Promise<unknown>;
+}
+interface DomMutation {
+  addedNodes: ArrayLike<unknown>;
+  removedNodes: ArrayLike<unknown>;
+  target: unknown;
+  attributeName?: string | null;
+  type: string;
 }
 declare const document: {
   documentElement: DomElement;
@@ -54,7 +70,11 @@ declare const document: {
   elementsFromPoint(x: number, y: number): DomElement[];
   addEventListener(type: "keydown", listener: (event: KeyEvent) => void, capture?: boolean): void;
   removeEventListener(type: "keydown", listener: (event: KeyEvent) => void, capture?: boolean): void;
-  body: unknown;
+  addEventListener(type: "scroll", listener: (event: { target: unknown }) => void, capture?: boolean): void;
+  removeEventListener(type: "scroll", listener: (event: { target: unknown }) => void, capture?: boolean): void;
+  addEventListener(type: "wheel" | "touchstart" | "pointerdown", listener: (event: { target: unknown }) => void, capture?: boolean): void;
+  removeEventListener(type: "wheel" | "touchstart" | "pointerdown", listener: (event: { target: unknown }) => void, capture?: boolean): void;
+  body: DomElement;
   head: { appendChild(el: DomElement): void };
 };
 interface Canvas2d {
@@ -63,6 +83,7 @@ interface Canvas2d {
   getImageData(x: number, y: number, w: number, h: number): { data: ArrayLike<number> };
 }
 interface KeyEvent {
+  target: unknown;
   key: string;
   altKey: boolean;
   metaKey: boolean;
@@ -74,7 +95,8 @@ declare function setTimeout(cb: () => void, ms: number): number;
 declare const HTMLIFrameElement: { prototype: { setAttribute(name: string, value: string): void } };
 type MessageListener = (event: { source: unknown; data: unknown }) => void;
 declare const window: { addEventListener(type: "message", listener: MessageListener): void; removeEventListener(type: "message", listener: MessageListener): void };
-declare function requestAnimationFrame(cb: () => void): number;
+declare function requestAnimationFrame(cb: (timestamp: number) => void): number;
+declare function cancelAnimationFrame(id: number): void;
 declare function getComputedStyle(el: DomElement): {
   transform: string;
   borderRightWidth: string;
@@ -102,9 +124,14 @@ declare class ResizeObserver {
   disconnect(): void;
 }
 declare function getSelection(): { toString(): string } | null;
-declare function matchMedia(query: string): { matches: boolean };
+interface MediaQuery {
+  matches: boolean;
+  addEventListener(type: "change", listener: () => void): void;
+  removeEventListener(type: "change", listener: () => void): void;
+}
+declare function matchMedia(query: string): MediaQuery;
 declare class MutationObserver {
-  constructor(cb: (records: Array<{ addedNodes: ArrayLike<unknown>; removedNodes: ArrayLike<unknown>; target: unknown; attributeName?: string | null; type: string }>) => void);
+  constructor(cb: (records: DomMutation[]) => void);
   observe(target: unknown, options: { childList: boolean; subtree: boolean; characterData?: boolean; attributes?: boolean; attributeFilter?: string[] }): void;
   disconnect(): void;
 }
@@ -230,6 +257,8 @@ interface DomWatcher {
   settled?: (textRoots: DomElement[]) => void;
   /** Runs before the browser paints, with the elements just removed and the parents they left. */
   removed?: (nodes: Array<{ el: DomElement; from: DomElement }>) => void;
+  /** Runs once for each raw mutation batch, before the browser paints. */
+  mutated?: (records: DomMutation[]) => void;
 }
 
 // One observer for every watcher: Paseo mutates the DOM on each streamed token.
@@ -270,11 +299,12 @@ export function watchDom(watcher: DomWatcher, cleanup: () => void) {
         }
       }
       const added = distinctRoots(roots);
+      for (const w of watchers) w.mutated?.(records);
       if (added.length) for (const w of watchers) w.added?.(added);
       if (removed.length) for (const w of watchers) w.removed?.(removed);
       settleTimer ??= setTimeout(settle, 250);
     });
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-expanded", "data-state"] });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-expanded", "data-state", "data-reveal-length"] });
   }
   watcher.added?.([document.body as DomElement]);
   watcher.settled?.([]);
@@ -288,6 +318,462 @@ export function watchDom(watcher: DomWatcher, cleanup: () => void) {
       textRoots.clear();
     }
     cleanup();
+  };
+}
+
+const CHAT = '[data-testid="agent-chat-scroll"]';
+const CHAT_CONTENT = '[data-testid="agent-chat-content"]';
+const CHAT_TIMELINE = '[data-testid="agent-chat-timeline"]';
+const HISTORY_ROW = "[data-history-row-id]";
+const WORKING = '[data-testid="turn-working-indicator"]';
+const REPLY = '[data-testid="assistant-message"]';
+const chatDisclosureQuietUntil = new WeakMap<DomElement, number>();
+const cancelChatRise = new WeakMap<DomElement, () => void>();
+
+interface ContentRise {
+  start(distance: number): void;
+  prepare(distance: number): void;
+  cancel(): void;
+  dispose(): void;
+}
+
+interface ChatMotionState {
+  seen: Set<string>;
+  pending: Set<string>;
+  pendingTools: Set<string>;
+  running: boolean;
+  scrollTop: number;
+  compensatedScrollTop: number;
+  maxScrollTop: number;
+  clientWidth: number;
+  entryQuietUntil: number;
+  toolLeadUntil: number;
+  hydrationQuietUntil: number;
+  reflowQuietUntil: number;
+}
+
+// Preserve enough of each inverse scroll offset for the viewport movement to
+// read as one continuous rise. A shorter decay technically animated the full
+// distance, but spent most of it before the arriving text became visible.
+const CHAT_RISE_DECAY_MS = 150;
+const TOOL_SUMMARY_SCROLL_LEAD_PX = 6;
+const TOOL_SUMMARY_ENTRY_DELAY_MS = 32;
+
+function contentRise(element: DomElement): ContentRise {
+  let offset = 0;
+  let startedAt = 0;
+  let active: DomAnimation[] = [];
+  let generation = 0;
+  const originalOverflow = element.style.getPropertyValue("overflow");
+  const layered = element.matches(CHAT_CONTENT);
+  element.setAttribute("data-cp-stream-rise", "");
+  const currentOffset = () => {
+    if (!active.length) return 0;
+    const value = offset * Math.exp(-Math.max(0, performance.now() - startedAt) / CHAT_RISE_DECAY_MS);
+    return Math.abs(value) < 0.5 ? 0 : value;
+  };
+  const restoreOverflow = () => {
+    if (!layered) return;
+    if (originalOverflow) element.style.setProperty("overflow", originalOverflow);
+    else element.style.removeProperty("overflow");
+  };
+  const stopAnimations = () => {
+    generation++;
+    for (const animation of active) animation.cancel();
+    active = [];
+  };
+  const begin = (distance: number, holdFirstFrame: boolean) => {
+    if (!Number.isFinite(distance) || Math.abs(distance) <= 0.5) return;
+    // Retarget from the decay's authoritative value, never from a sampled
+    // computed transform. Consecutive chunks therefore add momentum without
+    // restarting from a stale browser frame.
+    const next = currentOffset() + distance;
+    stopAnimations();
+    if (Math.abs(next) <= 0.5) return restoreOverflow();
+    // Transforming the scroll-height owner expands its scrollable overflow,
+    // causing the host's bottom follow to move twice. Animate its inner layers
+    // inside a clipped, layout-stable surface instead.
+    const targets = layered ? Array.from(element.children) : [element];
+    if (!targets.length || targets.some((target) => !target.animate)) return restoreOverflow();
+    if (layered) element.style.setProperty("overflow", "clip");
+    offset = next;
+    startedAt = performance.now() + (holdFirstFrame ? 16 : 0);
+    const duration = Math.min(760, Math.max(220, CHAT_RISE_DECAY_MS * Math.log(Math.abs(offset) / 0.5)));
+    const steps = Math.max(12, Math.ceil(duration / 16));
+    const frames = Array.from({ length: steps + 1 }, (_, index) => {
+      const progress = index / steps;
+      const value = index === steps ? 0 : offset * Math.exp(-(progress * duration) / CHAT_RISE_DECAY_MS);
+      return { offset: progress, transform: `translateY(${value}px)` };
+    });
+    const animations = targets.map((target) => target.animate!(frames, { duration, delay: holdFirstFrame ? 16 : 0, easing: "linear", fill: "both" }));
+    const ownGeneration = generation;
+    active = animations;
+    const finish = () => {
+      if (generation !== ownGeneration || active !== animations) return;
+      active = [];
+      offset = 0;
+      for (const animation of animations) animation.cancel();
+      restoreOverflow();
+    };
+    void Promise.all(animations.map((animation) => animation.finished)).then(finish, finish);
+  };
+  const cancel = () => {
+    stopAnimations();
+    offset = 0;
+    startedAt = 0;
+    restoreOverflow();
+  };
+  return {
+    start: (distance) => begin(distance, false),
+    prepare: (distance) => begin(distance, true),
+    cancel,
+    dispose: () => {
+      cancel();
+      element.removeAttribute("data-cp-stream-rise");
+    },
+  };
+}
+
+/**
+ * Adds viewport-follow and entry motion around Paseo's paced Markdown
+ * renderer. Text paint stays entirely renderer-owned so reflow cannot leave
+ * duplicate glyph covers or completion-time handoffs behind.
+ */
+export function smoothStreamingText(enabled: () => boolean = () => true, subscribe?: (listener: () => void) => () => void) {
+  if (Platform.OS !== "web" || typeof document === "undefined") return () => {};
+  const chatStates = new WeakMap<DomElement, ChatMotionState>();
+  const chatRises = new WeakMap<DomElement, ContentRise>();
+  const userScrollUntil = new WeakMap<DomElement, number>();
+  const rises = new Set<ContentRise>();
+  const entryAnimations = new Map<DomAnimation, () => void>();
+  const toolEntryAnimations = new Map<DomAnimation, () => void>();
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)");
+  const observedChats = new WeakSet<DomElement>();
+  const observedContent = new WeakSet<DomElement>();
+  const elementOf = (node: unknown) => {
+    const typed = node as { nodeType?: number; parentElement?: DomElement | null };
+    return typed.nodeType === 1 ? node as DomElement : typed.parentElement ?? null;
+  };
+  const chatsFrom = (records: DomMutation[]) => {
+    const chats = new Set<DomElement>();
+    const add = (node: unknown, includeNested: boolean) => {
+      const element = elementOf(node);
+      if (!element) return;
+      const chat = element.matches(CHAT) ? element : element.closest(CHAT);
+      if (chat) chats.add(chat);
+      if (includeNested) for (const nested of Array.from(element.querySelectorAll(CHAT))) chats.add(nested);
+    };
+    for (const record of records) {
+      const target = elementOf(record.target);
+      if (record.attributeName === "style" && target?.hasAttribute("data-cp-stream-rise")) continue;
+      add(record.target, false);
+      for (const node of Array.from(record.addedNodes)) add(node, true);
+    }
+    return chats;
+  };
+  const historyRemovalChats = (records: DomMutation[]) => {
+    const chats = new Set<DomElement>();
+    for (const record of records) {
+      const removedIds = Array.from(record.removedNodes).flatMap((node) => {
+        const element = elementOf(node);
+        if (!element) return [];
+        const rows = element.matches(HISTORY_ROW)
+          ? [element]
+          : Array.from(element.querySelectorAll(HISTORY_ROW));
+        return rows.map((row) => row.getAttribute("data-history-row-id")).filter((id): id is string => Boolean(id));
+      });
+      if (!removedIds.length) continue;
+      const target = elementOf(record.target);
+      const chat = target?.matches(CHAT) ? target : target?.closest(CHAT);
+      if (!chat) continue;
+      const currentIds = new Set(Array.from(chat.querySelectorAll(HISTORY_ROW))
+        .map((row) => row.getAttribute("data-history-row-id"))
+        .filter((id): id is string => Boolean(id)));
+      if (removedIds.some((id) => !currentIds.has(id))) chats.add(chat);
+    }
+    return chats;
+  };
+  const animateEntry = (row: DomElement) => {
+    if (reduced.matches || !row.animate) return;
+    const originalOrigin = row.style.getPropertyValue("transform-origin");
+    // A bubble should appear to inflate from its lower-right edge, then settle
+    // into place with a nearly imperceptible one-and-a-half-pixel rebound.
+    row.style.setProperty("transform-origin", "100% 100%");
+    const animation = row.animate([
+      { offset: 0, opacity: 0, transform: "translateY(6px) scale(.96)" },
+      { offset: 0.76, opacity: 1, transform: "translateY(-1.5px) scale(1.002)" },
+      { opacity: 1, transform: "translateY(0) scale(1)" },
+    ], { duration: 320, easing: "cubic-bezier(0.22, 1, 0.36, 1)", fill: "both" });
+    const resetOrigin = () => {
+      if (originalOrigin) row.style.setProperty("transform-origin", originalOrigin);
+      else row.style.removeProperty("transform-origin");
+    };
+    entryAnimations.set(animation, resetOrigin);
+    const finishEntry = () => {
+      const reset = entryAnimations.get(animation);
+      if (!reset) return;
+      entryAnimations.delete(animation);
+      animation.cancel();
+      reset();
+    };
+    void animation.finished.then(finishEntry, finishEntry);
+  };
+  const animateToolSummary = (tool: DomElement) => {
+    const button = tool.querySelector("button");
+    const line = tool.querySelector('[data-cp-part="row-label"]')
+      ?? tool.querySelector("button > div > div:nth-child(2)")
+      ?? button;
+    if (reduced.matches || !line?.animate) return;
+    const clipOwner = line === button ? tool : button;
+    const originalOverflow = clipOwner?.style.getPropertyValue("overflow") ?? "";
+    if (clipOwner) clipOwner.style.setProperty("overflow", "clip");
+    // Match the plugin row's state transition: its words arrive with a small
+    // lift after the viewport has begun making room. The icon and details stay
+    // outside this animation, preserving disclosure and status motion.
+    const animation = line.animate([
+      { opacity: 0.25, transform: "translateY(4px)" },
+      { opacity: 1, transform: "translateY(0)" },
+    ], { duration: 240, delay: TOOL_SUMMARY_ENTRY_DELAY_MS, easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "both" });
+    const restoreOverflow = () => {
+      if (!clipOwner) return;
+      if (originalOverflow) clipOwner.style.setProperty("overflow", originalOverflow);
+      else clipOwner.style.removeProperty("overflow");
+    };
+    toolEntryAnimations.set(animation, restoreOverflow);
+    const finishEntry = () => {
+      const restore = toolEntryAnimations.get(animation);
+      if (!restore) return;
+      toolEntryAnimations.delete(animation);
+      animation.cancel();
+      restore();
+    };
+    void animation.finished.then(finishEntry, finishEntry);
+  };
+  const updateChat = (chat: DomElement, animate: boolean, hydrationBoundary = false) => {
+    if (!chat.isConnected) return;
+    const old = chatStates.get(chat);
+    const rows = Array.from(chat.querySelectorAll(HISTORY_ROW));
+    const running = Boolean(chat.querySelector(WORKING));
+    const maxScrollTop = Math.max(0, chat.scrollHeight - chat.clientHeight);
+    const atBottom = maxScrollTop - chat.scrollTop < 180;
+    const seen = old?.seen ?? new Set<string>();
+    const pending = animate && !hydrationBoundary ? old?.pending ?? new Set<string>() : new Set<string>();
+    const pendingTools = animate && !hydrationBoundary ? old?.pendingTools ?? new Set<string>() : new Set<string>();
+    const firstHistoryPopulation = Boolean(old && old.seen.size === 0 && rows.length > 0);
+    const hydrationQuietUntil = hydrationBoundary || firstHistoryPopulation ? Date.now() + 500 : old?.hydrationQuietUntil ?? 0;
+    const suppressHydrationMotion = Date.now() < hydrationQuietUntil;
+    const widthChanged = Boolean(old && Math.abs(chat.clientWidth - old.clientWidth) > 0.5);
+    // Sidebar motion can trigger several trailing wraps. They are viewport
+    // reflow, not arriving content, so cancel the current rise and keep a
+    // short quiet boundary alive through the host's follow-up scroll event.
+    const reflowQuietUntil = widthChanged ? Date.now() + 120 : old?.reflowQuietUntil ?? 0;
+    const suppressWidthReflowMotion = Date.now() < reflowQuietUntil;
+    let entered = 0;
+    let toolEntered = 0;
+    for (const row of rows) {
+      const id = row.getAttribute("data-history-row-id");
+      if (!id) continue;
+      const isNew = !seen.has(id);
+      const isUserMessage = Boolean(row.querySelector('[data-testid="user-message"]'));
+      const toolSummary = row.querySelector(ROW);
+      seen.add(id);
+      // The scale/translation bubble entrance belongs only to sent messages.
+      // Assistant text reveals token-by-token; native tool summaries receive
+      // the smaller label rise coordinated below with their viewport lead.
+      if (isUserMessage && shouldQueueMessageEntrance({
+        hasPreviousChatState: Boolean(old),
+        wasRunning: Boolean(old?.running),
+        running,
+        isUserMessage,
+        suppressHydrationMotion,
+        isNew,
+        allow: animate,
+        atBottom,
+      })) pending.add(id);
+      if (toolSummary && shouldQueueMessageEntrance({
+        hasPreviousChatState: Boolean(old),
+        wasRunning: Boolean(old?.running),
+        running,
+        isUserMessage: false,
+        suppressHydrationMotion,
+        isNew,
+        allow: animate,
+        atBottom,
+      })) pendingTools.add(id);
+      const box = row.getBoundingClientRect();
+      if (pending.has(id) && box.width > 0 && box.height > 0) {
+        pending.delete(id);
+        if (animate && atBottom && !suppressHydrationMotion && entered++ < 12) animateEntry(row);
+      }
+      if (pendingTools.has(id) && box.width > 0 && box.height > 0) {
+        pendingTools.delete(id);
+        if (animate && atBottom && !suppressHydrationMotion && !suppressWidthReflowMotion && toolEntered++ < 12 && toolSummary) animateToolSummary(toolSummary);
+      }
+    }
+    const currentIds = new Set(rows.map((row) => row.getAttribute("data-history-row-id")).filter((id): id is string => Boolean(id)));
+    for (const id of pending) if (!atBottom || !currentIds.has(id)) pending.delete(id);
+    for (const id of pendingTools) if (!atBottom || !currentIds.has(id)) pendingTools.delete(id);
+    while (seen.size > 5000) seen.delete(seen.values().next().value!);
+
+    let compensatedScrollTop = chat.scrollTop;
+    // Completion details are a sibling of the timeline, so the whole content
+    // surface must rise when either messages, tools, or the footer add height.
+    const riseSurface = chat.querySelector(CHAT_CONTENT) ?? chat.querySelector(CHAT_TIMELINE) ?? rows[0]?.parentElement ?? null;
+    const suppressDisclosureRise = Date.now() < (chatDisclosureQuietUntil.get(chat) ?? 0);
+    let toolLeadUntil = toolEntered > 0 ? Date.now() + 120 : old?.toolLeadUntil ?? 0;
+    // animateEntry writes transform-origin, which produces a second mutation.
+    // Keep ownership with the bubble for its full entrance so that mutation
+    // cannot replay the same height delta as a parent timeline rise.
+    const entryQuietUntil = entered > 0 ? Date.now() + 340 : old?.entryQuietUntil ?? 0;
+    const entryOwnsMotion = Date.now() < entryQuietUntil;
+    if (old && animate && riseSurface && atBottom && !reduced.matches && !entryOwnsMotion && !suppressHydrationMotion && !suppressWidthReflowMotion && !suppressDisclosureRise) {
+      const wasFollowing = old.maxScrollTop - old.scrollTop < 180;
+      const anticipatesHostFollow = wasFollowing && maxScrollTop > old.maxScrollTop && chat.scrollTop <= old.compensatedScrollTop + 0.5;
+      if (anticipatesHostFollow) compensatedScrollTop = maxScrollTop;
+      const layoutDistance = compensatedScrollTop - old.compensatedScrollTop;
+      const applyToolLead = Date.now() < toolLeadUntil && layoutDistance > 0.5;
+      const distance = layoutDistance + (applyToolLead ? TOOL_SUMMARY_SCROLL_LEAD_PX : 0);
+      if (applyToolLead) toolLeadUntil = 0;
+      let rise = chatRises.get(chat);
+      if (!rise) {
+        rise = contentRise(riseSurface);
+        chatRises.set(chat, rise);
+        cancelChatRise.set(chat, () => rise?.cancel());
+        rises.add(rise);
+      }
+      if (anticipatesHostFollow) rise.prepare(distance);
+      else rise.start(distance);
+    } else if (entryOwnsMotion || suppressHydrationMotion || suppressWidthReflowMotion || suppressDisclosureRise) chatRises.get(chat)?.cancel();
+    chatStates.set(chat, {
+      seen,
+      pending,
+      pendingTools,
+      running,
+      scrollTop: chat.scrollTop,
+      compensatedScrollTop,
+      maxScrollTop,
+      clientWidth: chat.clientWidth,
+      entryQuietUntil,
+      toolLeadUntil,
+      hydrationQuietUntil,
+      reflowQuietUntil,
+    });
+  };
+
+  let motionEnabled = enabled();
+  const stopActiveMotion = () => {
+    for (const rise of rises) rise.cancel();
+    for (const [animation, reset] of entryAnimations) {
+      animation.cancel();
+      reset();
+    }
+    entryAnimations.clear();
+    for (const [animation, restore] of toolEntryAnimations) {
+      animation.cancel();
+      restore();
+    }
+    toolEntryAnimations.clear();
+  };
+  const syncEnabled = () => {
+    const next = enabled();
+    if (next === motionEnabled) return next;
+    motionEnabled = next;
+    stopActiveMotion();
+    // Rebase snapshots and geometry at the preference boundary. Re-enabling
+    // should only animate content that arrives after the switch changes.
+    for (const chat of Array.from(document.querySelectorAll(CHAT))) updateChat(chat, false);
+    return next;
+  };
+
+  const resizeObserver = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(() => {
+    const animate = syncEnabled();
+    for (const chat of Array.from(document.querySelectorAll(CHAT))) if (observedChats.has(chat)) updateChat(chat, animate);
+  });
+  const observeChat = (chat: DomElement) => {
+    if (!observedChats.has(chat)) {
+      observedChats.add(chat);
+      resizeObserver?.observe(chat);
+    }
+    const content = chat.querySelector(CHAT_CONTENT) ?? chat.firstElementChild;
+    if (content && !observedContent.has(content)) {
+      observedContent.add(content);
+      // The scroller's border box does not change when a mounted tool gains
+      // details. Its content box does, and ResizeObserver reports that after
+      // layout but before paint, when the real scroll-height delta is known.
+      resizeObserver?.observe(content);
+    }
+  };
+  for (const chat of Array.from(document.querySelectorAll(CHAT))) {
+    updateChat(chat, false);
+    observeChat(chat);
+  }
+  const onScroll = (event: { target: unknown }) => {
+    const target = event.target as DomElement | null;
+    if (!target?.matches?.(CHAT)) return;
+    const old = chatStates.get(target);
+    if (!old) return updateChat(target, false);
+    if (Date.now() < (userScrollUntil.get(target) ?? 0)) chatRises.get(target)?.cancel();
+    // A scroll commits a viewport position; it is never new streamed output.
+    // Rebase the next mutation without replaying this delta as timeline motion.
+    chatStates.set(target, {
+      ...old,
+      scrollTop: target.scrollTop,
+      compensatedScrollTop: target.scrollTop,
+      maxScrollTop: Math.max(0, target.scrollHeight - target.clientHeight),
+      clientWidth: target.clientWidth,
+    });
+  };
+  const markUserScroll = (event: { target: unknown }) => {
+    const target = event.target as DomElement | null;
+    const chat = target?.matches?.(CHAT) ? target : target?.closest?.(CHAT);
+    if (!chat) return;
+    userScrollUntil.set(chat, Date.now() + 250);
+    chatRises.get(chat)?.cancel();
+  };
+  const markKeyboardScroll = (event: KeyEvent) => {
+    if (!["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) return;
+    markUserScroll(event);
+  };
+  const onReducedMotion = () => {
+    if (!reduced.matches) return;
+    stopActiveMotion();
+  };
+  document.addEventListener("scroll", onScroll, true);
+  document.addEventListener("wheel", markUserScroll, true);
+  document.addEventListener("touchstart", markUserScroll, true);
+  document.addEventListener("pointerdown", markUserScroll, true);
+  document.addEventListener("keydown", markKeyboardScroll, true);
+  reduced.addEventListener("change", onReducedMotion);
+  const unwatch = watchDom({
+    mutated: (records) => {
+      const animate = syncEnabled();
+      const hydrating = historyRemovalChats(records);
+      for (const chat of chatsFrom(records)) {
+        observeChat(chat);
+        updateChat(chat, animate, hydrating.has(chat));
+      }
+    },
+    added: (roots) => {
+      for (const chat of within(roots, CHAT)) {
+        if (!chatStates.has(chat)) updateChat(chat, false);
+        observeChat(chat);
+      }
+    },
+  }, () => {
+    document.removeEventListener("scroll", onScroll, true);
+    document.removeEventListener("wheel", markUserScroll, true);
+    document.removeEventListener("touchstart", markUserScroll, true);
+    document.removeEventListener("pointerdown", markUserScroll, true);
+    document.removeEventListener("keydown", markKeyboardScroll, true);
+    reduced.removeEventListener("change", onReducedMotion);
+    resizeObserver?.disconnect();
+    stopActiveMotion();
+    for (const rise of rises) rise.dispose();
+  });
+  const unsubscribe = subscribe?.(() => void syncEnabled());
+  return () => {
+    unsubscribe?.();
+    unwatch();
   };
 }
 
@@ -320,7 +806,6 @@ const SELECT_CSS = `
 [data-cp-select] > button { height: 24px; padding: 0 8px; border: 0; border-radius: 6px; background: transparent; color: var(--cp-fg, var(--colors-foreground)); font-family: inherit; font-size: 12px; font-weight: 500; white-space: nowrap; cursor: pointer; }
 [data-cp-select] > button:hover { background-color: color-mix(in srgb, var(--cp-control, var(--colors-surface2)), var(--cp-fg, var(--colors-foreground)) 12%); }
 `;
-const REPLY = '[data-testid="assistant-message"]';
 type SelNode = { nodeType: number; parentElement: DomElement | null };
 type Selected = { isCollapsed: boolean; rangeCount: number; toString(): string; getRangeAt(i: 0): { startContainer: SelNode; endContainer: SelNode; getBoundingClientRect(): ReturnType<DomElement["getBoundingClientRect"]> } };
 type CopyEvent = { target: unknown; key?: string; shiftKey?: boolean; clipboardData?: { setData(type: string, data: string): void }; preventDefault(): void; stopImmediatePropagation(): void };
@@ -433,11 +918,18 @@ const CLAMP_CSS = `
  */
 export function clampUserMessages(enabled: () => boolean) {
   const bound = new Map<DomElement, () => void>();
+  const animations = new Map<DomElement, DomAnimation>();
   let style: DomElement | undefined;
+  const stopAnimation = (text: DomElement) => {
+    animations.get(text)?.cancel();
+    animations.delete(text);
+  };
   const release = () => {
     for (const [bubble, onClick] of bound) {
       bubble.removeEventListener("click", onClick);
       bubble.removeAttribute(CLAMP);
+      const text = bubble.lastElementChild;
+      if (text) stopAnimation(text);
     }
     bound.clear();
   };
@@ -445,6 +937,8 @@ export function clampUserMessages(enabled: () => boolean) {
     for (const [bubble, onClick] of bound) if (!bubble.isConnected) {
       bubble.removeEventListener("click", onClick);
       bubble.removeAttribute(CLAMP);
+      const text = bubble.lastElementChild;
+      if (text) stopAnimation(text);
       bound.delete(bubble);
     }
   };
@@ -463,13 +957,38 @@ export function clampUserMessages(enabled: () => boolean) {
         const css = getComputedStyle(text);
         const line = parseFloat(css.lineHeight) || parseFloat(css.fontSize) * 1.4;
         if (!line || text.scrollHeight < line * CLAMP_FROM_LINES) continue;
-        bubble.style.setProperty("--chat-polish-max", `${Math.round(line * SHOWN_LINES)}px`);
+        const collapsedHeight = Math.round(line * SHOWN_LINES);
+        bubble.style.setProperty("--chat-polish-max", `${collapsedHeight}px`);
         bubble.style.setProperty("--chat-polish-muted", css.color);
         bubble.setAttribute(CLAMP, "closed");
         // Selecting text inside the bubble shouldn't toggle it.
         const onClick = () => {
           if (getSelection()?.toString()) return;
-          bubble.setAttribute(CLAMP, bubble.getAttribute(CLAMP) === "open" ? "closed" : "open");
+          const opening = bubble.getAttribute(CLAMP) !== "open";
+          const from = text.getBoundingClientRect().height;
+          const to = opening ? text.scrollHeight : collapsedHeight;
+          stopAnimation(text);
+          bubble.setAttribute(CLAMP, opening ? "open" : "closed");
+          const motion = document.documentElement.getAttribute("data-cp-rt-motion") !== "off"
+            && !matchMedia("(prefers-reduced-motion: reduce)").matches
+            && Boolean(text.animate)
+            && Math.abs(to - from) > 0.5;
+          if (bubble.closest(CHAT)) followExpansionAtBottom(motion);
+          if (!motion) return;
+          const animation = text.animate!([
+            { maxHeight: `${from}px` },
+            { maxHeight: `${to}px` },
+          ], { duration: TOOL_DISCLOSURE_MS, easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "both" });
+          animations.set(text, animation);
+          const finish = () => {
+            if (animations.get(text) !== animation) return;
+            animations.delete(text);
+            // Reveal the responsive base state after the measured transition.
+            // Open bubbles then follow reflow naturally; closed ones return to
+            // the line-based CSS clamp.
+            animation.cancel();
+          };
+          void animation.finished.then(finish, finish);
         };
         bubble.addEventListener("click", onClick);
         bound.set(bubble, onClick);
@@ -546,6 +1065,7 @@ const COMPOSER_BUTTON =
   ':is([data-testid="message-input-attach-button"], [data-testid^="agent-feature-"], [data-testid="workspace-create-submit"], [data-testid="context-window-meter"], button:is([aria-label="Open agent features"], [aria-label="Start dictation"], [aria-label="Send message"], [aria-label="Queue message"], [aria-label="Stop agent"], [aria-label$="Voice mode"]))';
 const SLASH = '[data-testid="composer-autocomplete-popover"]';
 const SLASH_GLIDE_MS = 140;
+export const TOOL_DISCLOSURE_MS = 220;
 const CHIP = ':is([data-testid="combined-model-selector"], [data-testid="agent-thinking-selector"], [data-testid="mode-control"])';
 const PERMISSION = '[data-cp-part="permission"]';
 const PLAN = '[data-testid="permission-plan-card"]';
@@ -888,9 +1408,9 @@ ${ROW} > button { background-color: transparent !important; border-color: transp
 [data-cp-part="att-files"] > * > div > :last-child > :first-child { font-size: 13px !important; font-weight: 500 !important; color: var(--cp-fg) !important; }
 [data-cp-part="att-files"] > * > div > :last-child > :last-child { font-size: 12px !important; color: var(--cp-muted) !important; }
 /* Density (Prefs.density) and faded row strength (Prefs.steps) as variables the rules below read; views.tsx matches them (TIGHT, QUIET). */
-:root { --cp-d-item: 6px; --cp-d-pad: 4px; --cp-d-row-top: 2px; --cp-d-row-bottom: -8px; --cp-d-footer: 16px; --cp-d-prompt: 8px; --cp-d-li: 6px; --cp-quiet: 0.45; }
-:root[data-cp-rt-density="compact"] { --cp-d-item: 2px; --cp-d-pad: 2px; --cp-d-row-top: 0px; --cp-d-row-bottom: -12px; --cp-d-footer: 12px; --cp-d-prompt: 0px; --cp-d-li: 3px; }
-:root[data-cp-rt-density="spacious"] { --cp-d-item: 12px; --cp-d-pad: 6px; --cp-d-row-top: 5px; --cp-d-row-bottom: -3px; --cp-d-footer: 22px; --cp-d-prompt: 18px; --cp-d-li: 10px; }
+:root { --cp-d-item: ${CHAT_MARKDOWN_DENSITY.normal.itemGap}px; --cp-d-pad: ${CHAT_MARKDOWN_DENSITY.normal.padding}px; --cp-d-row-top: 2px; --cp-d-row-bottom: -8px; --cp-d-footer: 16px; --cp-d-prompt: 8px; --cp-d-li: 6px; --cp-quiet: 0.45; }
+:root[data-cp-rt-density="compact"] { --cp-d-item: ${CHAT_MARKDOWN_DENSITY.compact.itemGap}px; --cp-d-pad: ${CHAT_MARKDOWN_DENSITY.compact.padding}px; --cp-d-row-top: 0px; --cp-d-row-bottom: -12px; --cp-d-footer: 12px; --cp-d-prompt: 0px; --cp-d-li: 3px; }
+:root[data-cp-rt-density="spacious"] { --cp-d-item: ${CHAT_MARKDOWN_DENSITY.spacious.itemGap}px; --cp-d-pad: ${CHAT_MARKDOWN_DENSITY.spacious.padding}px; --cp-d-row-top: 5px; --cp-d-row-bottom: -3px; --cp-d-footer: 22px; --cp-d-prompt: 18px; --cp-d-li: 10px; }
 :root[data-cp-rt-steps="dim"] { --cp-quiet: 0.3; }
 :root[data-cp-rt-steps="soft"] { --cp-quiet: 0.65; }
 /* Chat rhythm (15px text): 18 between paragraphs, 20 between text and step rows, ~21 to the turn footer, 28 from a prompt to its
@@ -909,7 +1429,7 @@ ${ROW} > button { background-color: transparent !important; border-color: transp
 [data-testid="user-message"] { margin-top: var(--cp-d-prompt) !important; }
 [data-testid="user-message"] > div > div:first-child > :last-child { line-height: 1.55 !important; }
 
-${MSG} span { line-height: 1.6 !important; }
+${MSG} span { line-height: ${CHAT_MARKDOWN_LINE_HEIGHT} !important; }
 ${MSG} ${INLINE_CODE} { border-radius: 4px !important; padding: 2px 5px !important; }
 ${MSG} ${md("strong")}, ${MSG} ${md("strong")} span { font-weight: 600 !important; }
 ${MSG} ${HEADING(1)} { font-size: 24px !important; line-height: 1.3 !important; }
@@ -918,7 +1438,7 @@ ${MSG} ${HEADING(3)} { font-size: 16px !important; line-height: 1.3 !important; 
 ${MSG} ${md("h1")}, ${MSG} ${md("h2")} { border-bottom-width: 0 !important; padding-bottom: 0 !important; }
 ${MSG} ${md("li")}:not(:last-child) { margin-bottom: var(--cp-d-li) !important; }
 ${MSG} ${md("li")}:last-child { margin-bottom: 0 !important; }
-${MSG} ${MARK} { margin: 0 10px 0 4px !important; line-height: calc(var(--cp-content) * 1.6) !important; }
+${MSG} ${MARK} { margin: 0 10px 0 4px !important; line-height: calc(var(--cp-content) * ${CHAT_MARKDOWN_LINE_HEIGHT}) !important; }
 ${MSG} ${MARK_OL} { font-family: var(--cp-mono) !important; font-size: calc(var(--cp-code) + 1px) !important; }
 ${MSG} ${md("blockquote")} { background: transparent !important; border-left: 2px solid var(--cp-accent) !important; border-radius: 0 !important; padding: 2px 0 2px 14px !important; margin: 4px 0 !important; }
 ${MSG} ${md("blockquote")} > :last-child { margin-bottom: 0 !important; }
@@ -969,7 +1489,7 @@ ${THUMBS} > button div { width: 100% !important; height: 100% !important; backgr
    margin: the 0.11 spacing (item margin plus padding on both ends), with the 1.6 line height's leading on top. */
 ${MD} > * { margin-bottom: calc(var(--cp-d-item) + 2 * var(--cp-d-pad)) !important; }
 ${MD} > :last-child, ${MD} :is(blockquote, .enrm-admonition, li) > p:last-child { margin-bottom: 0 !important; }
-${MD} :is(p, li, blockquote) { line-height: 1.6 !important; }
+${MD} :is(p, li, blockquote) { line-height: ${CHAT_MARKDOWN_LINE_HEIGHT} !important; }
 ${MD} code { border-radius: 4px !important; padding: 2px 5px !important; }
 ${MD} strong { font-weight: 600 !important; }
 ${MD} h1 { font-size: 24px !important; line-height: 1.3 !important; }
@@ -1492,14 +2012,38 @@ export function stylePluginViews() {
   from { -webkit-mask-position: 150% 0; mask-position: 150% 0; }
   to { -webkit-mask-position: -50% 0; mask-position: -50% 0; }
 }
+@keyframes cp-stream-token {
+  from { opacity: 0; filter: blur(2px); }
+  to { opacity: 1; filter: blur(0); }
+}
+:root:not([data-cp-rt-motion="off"]) [data-cp-stream-token="true"] {
+  display: inline;
+  white-space: pre-wrap;
+  overflow: visible;
+  line-height: inherit !important;
+  animation: cp-stream-token ${STREAM_TOKEN_FADE_MS}ms cubic-bezier(0.22, 1, 0.36, 1) ${STREAM_TOKEN_PREROLL_MS}ms backwards;
+}
+:root:not([data-cp-rt-motion="off"]) [data-cp-image-arrival] {
+  transform-origin: 50% 100%;
+  animation: cp-image-arrival 340ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes cp-image-arrival {
+  from { opacity: 0.15; transform: translateY(7px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
 /* Animate the grid track instead of guessing a max-height; long and streaming output keep their natural size. */
 [data-cp-expand] { display: grid !important; grid-template-rows: 1fr; opacity: 1; transition: grid-template-rows 100ms cubic-bezier(0.23, 1, 0.32, 1), opacity 100ms ease-out; }
 [data-cp-expand="closed"] { grid-template-rows: 0fr; opacity: 0; pointer-events: none; }
+:root:not([data-cp-rt-motion="off"]) [data-cp-expand] { transition-duration: ${TOOL_DISCLOSURE_MS}ms, 160ms; }
+:root:not([data-cp-rt-motion="off"]) [data-cp-expand] > * { transition: transform ${TOOL_DISCLOSURE_MS}ms cubic-bezier(0.23, 1, 0.32, 1); }
+:root:not([data-cp-rt-motion="off"]) [data-cp-expand="closed"] > * { transform: translateY(-4px); }
 @starting-style {
-  [data-cp-expand="open"] { grid-template-rows: 0fr; opacity: 0.55; }
+  [data-cp-expand="open"]:not([data-cp-expand-restored]) { grid-template-rows: 0fr; opacity: 0.55; }
 }
 @media (prefers-reduced-motion: reduce) {
+  [data-cp-stream-token="true"] { animation: none !important; opacity: 1 !important; filter: none !important; }
   [data-cp-running-label] { animation: none; -webkit-mask-image: none; mask-image: none; }
+  [data-cp-image-arrival] { animation: none; }
   [data-cp-expand] { transition: none; }
   [data-cp-row], [data-cp-row] [dir], ${ROW} > button, ${ROW} [data-cp-part="row-label"] > [dir] { transition: none; }
 }`;
@@ -1965,7 +2509,7 @@ ${ADMONITION}[data-cp-callout="tip"] { --cp-tone: var(--cp-ok); --cp-icon: ${TIP
 ${ADMONITION}[data-cp-callout="warning"] { --cp-tone: var(--cp-warn); --cp-icon: ${ALERT_MASK}; }
 ${ADMONITION}[data-cp-callout="caution"] { --cp-tone: var(--colors-status-danger); --cp-icon: ${CAUTION_MASK}; }
 ${ADMONITION} p { color: var(--cp-fg) !important; }
-${ADMONITION} [data-cp-callout-head] { margin-bottom: 2px !important; font-size: 13px !important; font-weight: 600 !important; line-height: 1.6 !important; color: var(--cp-tone) !important; }
+${ADMONITION} [data-cp-callout-head] { margin-bottom: 2px !important; font-size: 13px !important; font-weight: 600 !important; line-height: ${CHAT_MARKDOWN_LINE_HEIGHT} !important; color: var(--cp-tone) !important; }
 /* Paseo's markdown library draws Octicons; the svg box stays as the slot and shows the plugin's Lucide icon instead. */
 ${ADMONITION} [data-cp-callout-head] svg { position: absolute; left: 13px; top: 13px; width: 14px; height: 14px; background: var(--cp-tone); -webkit-mask: var(--cp-icon) center / contain no-repeat; mask: var(--cp-icon) center / contain no-repeat; }
 ${ADMONITION} [data-cp-callout-head] svg > * { display: none; }
@@ -2580,11 +3124,18 @@ function visibleChat() {
 let stopExpansionFollow: (() => void) | undefined;
 
 /** Paseo 0.11.4 follows resized content one frame late. Keep an already pinned chat at the bottom before paint during a disclosure. */
-export function followExpansionAtBottom() {
+export function followExpansionAtBottom(motion = true) {
   if (Platform.OS !== "web" || typeof document === "undefined" || typeof ResizeObserver === "undefined") return;
   stopExpansionFollow?.();
   const chat = visibleChat();
-  if (!chat || getComputedStyle(chat).overflowAnchor === "none" || Math.abs(chat.scrollHeight - chat.clientHeight - chat.scrollTop) > 1) return;
+  if (!chat) return;
+  if (motion) {
+    // This resize belongs to the nested disclosure. Do not replay its
+    // bottom-follow scroll as streaming motion on the whole chat timeline.
+    chatDisclosureQuietUntil.set(chat, Date.now() + TOOL_DISCLOSURE_MS + 100);
+    cancelChatRise.get(chat)?.();
+  }
+  if (getComputedStyle(chat).overflowAnchor === "none" || Math.abs(chat.scrollHeight - chat.clientHeight - chat.scrollTop) > 1) return;
   const content = chat.firstElementChild;
   if (!content) return;
   const observer = new ResizeObserver(() => {
@@ -2600,8 +3151,8 @@ export function followExpansionAtBottom() {
     document.removeEventListener("keydown", stop, true);
     if (stopExpansionFollow === stop) stopExpansionFollow = undefined;
   };
-  // Includes the 100ms transition, its first frame, and deferred output removal.
-  const timer = setTimeout(stop, 200);
+  // Includes the transition, its first frame, and deferred output removal.
+  const timer = setTimeout(stop, motion ? TOOL_DISCLOSURE_MS + 100 : 200);
   stopExpansionFollow = stop;
   observer.observe(content);
   chat.addEventListener("wheel", stop, true);

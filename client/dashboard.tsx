@@ -317,18 +317,29 @@ function Legend({ theme }: { theme: PluginTheme }) {
   );
 }
 
-/** The switch for restyling Paseo's own items; it gates Rich text and the loaders, so it sits outside any one page. */
-function RestyleCard({ theme, prefs, onChange }: { theme: PluginTheme; prefs: Prefs; onChange(p: Prefs): void }) {
+/** Global switches that affect several pages, kept together outside any one page. */
+function GlobalCards({ theme, prefs, onChange }: { theme: PluginTheme; prefs: Prefs; onChange(p: Prefs): void }) {
   const s = useStyles(theme);
   const c = theme.colors;
+  const card = { gap: 6, padding: 10, borderRadius: 10, backgroundColor: c.surface1, borderWidth: StyleSheet.hairlineWidth, borderColor: c.border };
   return (
-    <View {...SQUIRCLE_CARD} style={{ gap: 6, padding: 10, borderRadius: 10, backgroundColor: c.surface1, borderWidth: StyleSheet.hairlineWidth, borderColor: c.border }}>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-        <Icon name="Paintbrush" size={14} color={c.foregroundMuted} />
-        <Text style={[s.verb, { flex: 1, fontSize: 13 }]}>Restyle Paseo's items</Text>
-        <Switch theme={theme} label="Restyle Paseo's items" value={prefs.nativeStyle === "design"} onChange={(on) => onChange({ ...prefs, nativeStyle: on ? "design" : "paseo" })} />
+    <View style={{ gap: 8 }}>
+      <View {...SQUIRCLE_CARD} style={card}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          <Icon name="Paintbrush" size={14} color={c.foregroundMuted} />
+          <Text style={[s.verb, { flex: 1, fontSize: 13 }]}>Restyle Paseo's items</Text>
+          <Switch theme={theme} label="Restyle Paseo's items" value={prefs.nativeStyle === "design"} onChange={(on) => onChange({ ...prefs, nativeStyle: on ? "design" : "paseo" })} />
+        </View>
+        <Text style={[s.small, { fontSize: 12 }]}>Bubbles, tool groups and markdown. Rich text and loaders need it.</Text>
       </View>
-      <Text style={[s.small, { fontSize: 12 }]}>Bubbles, tool groups and markdown. Rich text and loaders need it.</Text>
+      <View {...SQUIRCLE_CARD} style={card}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          <Icon name="Activity" size={14} color={c.foregroundMuted} />
+          <Text style={[s.verb, { flex: 1, fontSize: 13 }]}>Enable chat motion</Text>
+          <Switch theme={theme} label="Enable chat motion" value={prefs.motion} onChange={(motion) => onChange({ ...prefs, motion })} />
+        </View>
+        <Text style={[s.small, { fontSize: 12 }]}>Adds motion to message bubbles, streaming text, tool details and loaded images.</Text>
+      </View>
     </View>
   );
 }
@@ -467,7 +478,7 @@ function InnerNav({ theme, host, page, prefs, onSelect, onPrefs }: { theme: Plug
       ))}
       <View style={{ flex: 1 }} />
       <UpdateCard theme={theme} />
-      {canSetAppTheme ? <RestyleCard theme={theme} prefs={prefs} onChange={onPrefs} /> : null}
+      {canSetAppTheme ? <GlobalCards theme={theme} prefs={prefs} onChange={onPrefs} /> : null}
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 8 }}>
         <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: c.statusSuccess }} />
         <Text style={[s.small, { fontSize: 11 }]} numberOfLines={1}>
@@ -2177,7 +2188,7 @@ export function Dashboard({ theme, layout, host }: PluginScreenProps) {
             <Segmented<Page> theme={theme} value={page} onChange={setPage} options={PAGES.map((p) => [p.id, p.icon] as [Page, string])} />
             {canSetAppTheme && page !== "theme" ? (
               <View style={{ alignSelf: "stretch" }}>
-                <RestyleCard theme={theme} prefs={prefs} onChange={change} />
+                <GlobalCards theme={theme} prefs={prefs} onChange={change} />
               </View>
             ) : null}
           </View>
