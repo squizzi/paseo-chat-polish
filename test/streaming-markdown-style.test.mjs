@@ -21,6 +21,29 @@ test("streaming markdown uses Chat Polish's style contract", () => {
   assert.match(source, /paseoMarkdownTag/);
 });
 
+test("thinking panels apply the shared tail fade to paced streaming text", () => {
+  const views = readFileSync(new URL("../client/views.tsx", import.meta.url), "utf8");
+  const thought = views.slice(
+    views.indexOf("export function ThoughtItem"),
+    views.indexOf("export function PlanItem"),
+  );
+
+  assert.match(thought, /StreamWordFade/);
+  assert.match(thought, /enabled=\{motion && streaming\}/);
+  assert.match(thought, /<StreamFadeText content=\{para\}/);
+});
+
+test("completed merged tool runs expose their logical summary arrival", () => {
+  const views = readFileSync(new URL("../client/views.tsx", import.meta.url), "utf8");
+  const merged = views.slice(
+    views.indexOf("export function MergedSteps"),
+    views.indexOf("export function ThoughtItem"),
+  );
+
+  assert.match(views, /cpRunSummary/);
+  assert.match(merged, /\.\.\.\(!live \? RUN_SUMMARY : \{\}\)/);
+});
+
 test("the shared contract follows host typography and Chat Polish density", () => {
   const contractSource = readFileSync(new URL("../client/chat-markdown-style.ts", import.meta.url), "utf8");
   const js = ts.transpileModule(contractSource, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;

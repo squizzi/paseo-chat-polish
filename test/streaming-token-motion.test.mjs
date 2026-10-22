@@ -11,17 +11,18 @@ const { nextFadeState, settleFadeState, STREAM_TOKEN_PREROLL_MS, STREAM_TOKEN_FA
 
 test("streamed text waits briefly while chat-follow motion gets a head start", () => {
   assert.equal(STREAM_TOKEN_PREROLL_MS, 36);
-  assert.equal(STREAM_TOKEN_FADE_MS, 400);
+  assert.equal(STREAM_TOKEN_FADE_MS, 320);
   assert.equal(STREAM_FADE_DURATION_MS, STREAM_TOKEN_PREROLL_MS + STREAM_TOKEN_FADE_MS);
 });
 
-test("only the newest streamed tail keeps an active fade window", () => {
+test("recent streamed arrivals overlap to form a continuously moving tail", () => {
   const initial = { committed: "Hello", chunks: [] };
   const first = nextFadeState(initial, "Hello world", true, 100);
   const second = nextFadeState(first, "Hello world!", true, 180);
 
-  assert.equal(second.committed, "Hello world");
+  assert.equal(second.committed, "Hello");
   assert.deepEqual(second.chunks, [
+    { start: 5, text: " world", startedAtMs: 100 },
     { start: 11, text: "!", startedAtMs: 180 },
   ]);
 });

@@ -15,6 +15,7 @@ const liveEntry = {
   running: true,
   isUserMessage: false,
   suppressHydrationMotion: false,
+  isHydrating: false,
   isNew: true,
   allow: true,
   atBottom: true,
@@ -26,6 +27,14 @@ test("queues a newly arriving live row even before it becomes visible", () => {
 
 test("does not queue the first population of rehydrated history", () => {
   assert.equal(shouldQueueMessageEntrance({ ...liveEntry, suppressHydrationMotion: true }), false);
+});
+
+test("queues a new local prompt that arrives with a live turn during stale-tab hydration", () => {
+  assert.equal(shouldQueueMessageEntrance({ ...liveEntry, isUserMessage: true, suppressHydrationMotion: true }), true);
+});
+
+test("still ignores a restored user row when no turn is live", () => {
+  assert.equal(shouldQueueMessageEntrance({ ...liveEntry, running: false, isUserMessage: true, suppressHydrationMotion: true, isHydrating: true }), false);
 });
 
 test("does not turn passive assistant history into entry motion", () => {

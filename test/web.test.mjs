@@ -30,7 +30,7 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
         const animationsOf = (surface) => [surface, ...surface.children].flatMap((element) => element.getAnimations());
         const NativeObserver = MutationObserver; let batches = 0; let capped = false;
         window.MutationObserver = class extends NativeObserver {
-          constructor(cb) { super((records) => { if (++batches > 30) { capped = true; this.disconnect(); } else cb(records); }); }
+          constructor(cb) { super((records) => { if (++batches > 60) { capped = true; this.disconnect(); } else cb(records); }); }
         };
         let released = 0;
         const remove = EventTarget.prototype.removeEventListener;
@@ -142,7 +142,10 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           checks.messageEntryEases = entryFrames.some((frame) => String(frame.transform).includes('translateY'));
           checks.messageEntryGrowsFromBottomRight = enteringRow.style.transformOrigin === '100% 100%';
           checks.messageEntrySettlesWithTinyBounce = entryFrames.some((frame) => String(frame.transform).includes('translateY(-1.5px)'));
-          checks.completedTurnEntryDoesNotMoveTimeline = !animationsOf(streamContent).some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
+          checks.messageEntryEasesChatHeight = animationsOf(streamContent).some((animation) => animation.effect?.getKeyframes().some((frame) => {
+            const transform = String(frame.transform);
+            return transform.startsWith('translateY(') && Number.parseFloat(transform.slice('translateY('.length)) > 0;
+          }));
           const workingHost = streamChat.querySelector('[data-testid="agent-chat-content"]').lastElementChild;
           workingHost.innerHTML = '<div data-testid="turn-working-indicator">Working</div>';
           await wait(30);
@@ -166,15 +169,22 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           const hydrationChat = document.createElement('div');
           hydrationChat.dataset.testid = 'agent-chat-scroll';
           hydrationChat.style = 'width:220px;height:120px;overflow:auto';
-          hydrationChat.innerHTML = '<div data-testid="agent-chat-timeline"></div>';
+          hydrationChat.innerHTML = '<div data-testid="agent-chat-content"><div data-testid="agent-chat-timeline"></div></div>';
           document.body.appendChild(hydrationChat);
           await wait(30);
           const hydratedRow = document.createElement('div');
           hydratedRow.dataset.historyRowId = 'hydrated-user-row';
           hydratedRow.innerHTML = '<div data-testid="user-message">Existing prompt</div>';
-          hydrationChat.firstElementChild.appendChild(hydratedRow);
+          const hydrationTimeline = hydrationChat.querySelector('[data-testid="agent-chat-timeline"]');
+          hydrationTimeline.appendChild(hydratedRow);
           await wait(30);
           checks.hydrationDoesNotAnimate = !hydratedRow.getAnimations().some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
+          const promptAfterHydration = document.createElement('div');
+          promptAfterHydration.dataset.historyRowId = 'prompt-after-hydration';
+          promptAfterHydration.innerHTML = '<div data-testid="user-message">A new prompt</div>';
+          hydrationTimeline.appendChild(promptAfterHydration);
+          await wait(30);
+          checks.newPromptAfterHydrationEases = promptAfterHydration.getAnimations().some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
           hydrationChat.remove();
           motionEnabled = false;
           document.documentElement.dataset.cpRtMotion = 'off';
@@ -283,7 +293,7 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           const chat = document.createElement('div');
           chat.dataset.testid = 'agent-chat-scroll';
           chat.style = 'width:600px;height:400px;overflow:auto;overflow-anchor:auto';
-          chat.innerHTML = '<div data-testid="agent-chat-content" style="display:flex;flex-direction:column;padding:16px"><div data-testid="agent-chat-timeline"><div style="height:700px;flex-shrink:0;overflow-anchor:none"></div><div data-history-row-id="tool-row" style="flex-shrink:0"><button>Ran command</button><div data-cp-expand="closed"><div style="min-height:0;overflow:hidden"><div style="height:250px;margin:6px 0 12px">Output</div></div></div></div></div><div id="completion-host"><div data-testid="turn-working-indicator">Working</div></div></div>';
+          chat.innerHTML = '<div data-testid="agent-chat-content" style="display:flex;flex-direction:column;padding:16px"><div data-testid="agent-chat-timeline"><div style="height:700px;flex-shrink:0;overflow-anchor:none"></div><div data-history-row-id="tool-row" style="flex-shrink:0"><button>Ran command</button><div data-cp-expand="closed"><div style="min-height:0;overflow:hidden"><div style="height:250px;margin:6px 0 12px">Output</div></div></div></div><div data-history-row-id="merged-run-row" style="flex-shrink:0"><div id="merged-run" style="height:24px"><span data-cp-running-label="">Running command</span></div></div><div data-history-row-id="assistant-turn" style="flex-shrink:0"><div data-testid="assistant-message" style="height:36px">Finished reply</div><div id="turn-extras"></div></div></div><div id="completion-host"><div data-testid="turn-working-indicator">Working</div></div></div>';
           document.body.appendChild(chat);
           const content = chat.firstElementChild, expanding = chat.querySelector('[data-cp-expand]');
           chat.scrollTop = chat.scrollHeight; await wait();
@@ -330,7 +340,38 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           completionHost.innerHTML = '<div id="completion-footer"><div><button data-testid="assistant-fork-menu-trigger" aria-label="Fork"></button></div><span>Worked for 8m 40s</span></div>';
           requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
           await wait(30);
-          checks.completedTurnDetailsEaseChat = animationsOf(content).some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
+          const hasRise = (surface) => surface.getAnimations().some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
+          checks.completedTurnDetailsEaseChatWithoutMovingFooter = hasRise(toolTimeline) && !hasRise(completionHost);
+          animationsOf(content).forEach((animation) => animation.cancel());
+          await wait(450);
+          chat.scrollTop = chat.scrollHeight;
+          chat.dispatchEvent(new Event('scroll'));
+          const turnExtras = document.getElementById('turn-extras');
+          turnExtras.innerHTML = '<div data-cp-turn-recap="" style="height:26px">2 files +14 −3 · 4 commands</div>';
+          requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+          await wait(30);
+          const recapSummary = turnExtras.querySelector('[data-cp-turn-recap]');
+          const recapFrames = recapSummary.getAnimations().flatMap((animation) => animation.effect?.getKeyframes() ?? []);
+          checks.turnRecapEasesIntoChat = recapFrames.some((frame) => Number(frame.opacity) < 1 && String(frame.transform).includes('translateY(4px)'))
+            && animationsOf(content).some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          animationsOf(content).forEach((animation) => animation.cancel());
+          await wait(450);
+          chat.scrollTop = chat.scrollHeight;
+          chat.dispatchEvent(new Event('scroll'));
+          const mergedRun = document.getElementById('merged-run');
+          const runHeightBefore = chat.scrollHeight;
+          mergedRun.setAttribute('data-cp-run-summary', '');
+          mergedRun.firstElementChild.removeAttribute('data-cp-running-label');
+          mergedRun.firstElementChild.textContent = 'Thought twice and ran four commands';
+          mergedRun.style.height = '54px';
+          requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+          await wait(30);
+          const runHeightDelta = chat.scrollHeight - runHeightBefore;
+          const runRiseAnimation = toolTimeline.getAnimations().find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          const runRiseFrame = runRiseAnimation?.effect?.getKeyframes()[0];
+          const runViewportRise = Math.abs(Number.parseFloat(String(runRiseFrame?.transform).slice('translateY('.length)));
+          checks.completedToolSummaryGetsViewportLead = runHeightDelta > 0 && runViewportRise > runHeightDelta + 3
+            && mergedRun.getAnimations().length === 0;
           // Paseo 0.11.4 follows content resizing in the next animation frame.
           let hostFollowing = true;
           const hostFollow = new ResizeObserver(() => requestAnimationFrame(() => {
@@ -410,7 +451,7 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
     assert.equal(report.error, undefined, report.error);
     assert.deepEqual(report.errors, []);
     assert.deepEqual(Object.entries(report.checks).filter(([, passed]) => !passed).map(([check]) => check), []);
-    assert.equal(Object.keys(report.checks).length, 44);
+    assert.equal(Object.keys(report.checks).length, 47);
   } finally {
     server?.closeAllConnections(); server?.close();
     rmSync(temp, { recursive: true, force: true });
