@@ -14,7 +14,7 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
   const temp = mkdtempSync(join(tmpdir(), "chat-polish-web-test-"));
   let server;
   try {
-    const sources = Object.fromEntries(["chat-markdown-style", "css-guard", "message-entry-motion", "provider-icons", "streaming-token-motion", "web"].map((name) => [name, ts.transpileModule(readFileSync(new URL(`../client/${name}.ts`, import.meta.url), "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText]));
+    const sources = Object.fromEntries(["chat-markdown-style", "color", "css-guard", "disclosure-state", "message-entry-motion", "provider-icons", "streaming-token-motion", "web"].map((name) => [name, ts.transpileModule(readFileSync(new URL(`../client/${name}.ts`, import.meta.url), "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText]));
     // Paseo's bundle exports its mermaid document as a minified string literal, with JS-only escapes like \xHH.
     const bundle = String.raw`Object.defineProperty(a,"mermaidRuntimeHtml",{get:function(){return o}});const o='<!doctype html>\n<p class="x" title=\'y\'>\x3c!-- __PASEO_MERMAID_RUNTIME_RECEIVE__ \\x41 \u0041 \u{1F600} \v \/ --\x3e</p>';`;
     const mermaidDoc = "<!doctype html>\n<p class=\"x\" title='y'><!-- __PASEO_MERMAID_RUNTIME_RECEIVE__ \\x41 A \u{1F600} \v / --></p>";
@@ -23,7 +23,7 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
       <div data-testid="context-window-details" style="position:absolute;border:1px solid black;border-radius:12px;background:white"><div><span>Context</span><span>35% used</span></div><div data-testid="usage-report-test" style="height:180px">Usage</div></div>
       <div data-testid="assistant-message"><div data-paseo-markdown-tag="blockquote"><span id="marker">[!NO</span></div></div>
       <div><div data-testid="permission-request-deny" style="color:#888"><div><span>Deny</span></div></div><div data-testid="permission-request-action-always" style="color:#888"><div><span>Allow always</span></div></div><div data-testid="permission-request-action-once" style="color:#eee"><div><span>Allow once</span></div></div></div>
-      <div data-testid="agent-chat-scroll" id="stream-chat" style="width:220px;height:120px;overflow:auto;background:#111;color:black"><div data-testid="agent-chat-content"><div data-testid="agent-chat-timeline"><div style="height:150px;flex-shrink:0"></div><div data-history-row-id="stream-row"><div data-testid="assistant-message" data-reveal-length="5"><div class="enrm-text"><p><span id="stream-text" style="color:rgb(240, 241, 242)">Hello</span></p></div></div></div></div><div><div data-testid="turn-working-indicator">Working</div></div></div></div>
+      <div data-testid="agent-chat-scroll" id="stream-chat" style="width:220px;height:120px;overflow:auto;background:#111;color:black"><div data-testid="agent-chat-content"><div data-testid="agent-chat-timeline"><div style="height:150px;flex-shrink:0"></div><div data-history-row-id="stream-row"><div data-testid="assistant-message" data-cp-streaming-assistant="true" data-reveal-length="5"><div class="enrm-text"><p><span id="stream-text" style="color:rgb(240, 241, 242)">Hello</span></p></div></div></div></div><div><div data-testid="turn-working-indicator">Working</div></div></div></div>
       <script>
         const checks = {}; const errors = [];
         window.onerror = (message) => errors.push(String(message));
@@ -58,19 +58,21 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           return exports;
         }
         (async () => {
+          document.documentElement.style.setProperty('--colors-foreground-muted', 'rgb(150, 160, 170)');
           localStorage.removeItem('chat-polish:context-card-heights');
-          const first = prompts(); const web = load('web');
+          const first = prompts(); const web = load('web'); const disclosure = load('disclosure-state');
           const streamChat = document.getElementById('stream-chat');
           streamChat.scrollTop = streamChat.scrollHeight;
           document.querySelector('[data-testid="turn-working-indicator"]').remove();
           let motionEnabled = true, syncMotion;
-          const restyle = web.restyleNative(() => true); const clamp = web.clampUserMessages(() => true); const smooth = web.smoothStreamingText(() => motionEnabled, (listener) => (syncMotion = listener, () => {}));
+          const restyle = web.restyleNative(() => true); const clamp = web.clampUserMessages(() => true); const smooth = web.installChatMotion(() => motionEnabled, (listener) => (syncMotion = listener, () => {}));
           checks.mermaidDocFromBundle = (await web.loadMermaidDoc()) === new TextDecoder().decode(Uint8Array.from(atob("${Buffer.from(mermaidDoc).toString("base64")}"), (ch) => ch.charCodeAt(0)));
           await wait(); checks.observerSettles = !capped;
           // Extra permission actions follow Paseo's variant, which it shows only by label color.
           const action = (id) => document.querySelector('[data-testid="permission-request-action-' + id + '"]').dataset.cpPart;
           checks.permissionActionVariants = action('always') === 'secondary' && action('once') === 'primary';
           const clampedBubble = first.querySelector('[data-chat-polish-clamp]');
+          checks.clampControlUsesMutedForeground = getComputedStyle(clampedBubble, '::after').color === 'rgb(150, 160, 170)';
           const clampedText = clampedBubble.lastElementChild;
           const clampedHeight = clampedText.getBoundingClientRect().height;
           clampedBubble.dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -147,11 +149,13 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           const entryFrames = enteringRow.getAnimations().flatMap((animation) => animation.effect?.getKeyframes() ?? []);
           checks.messageEntryEases = entryFrames.some((frame) => String(frame.transform).includes('translateY'));
           checks.messageEntryGrowsFromBottomRight = enteringRow.style.transformOrigin === '100% 100%';
-          checks.messageEntrySettlesWithTinyBounce = entryFrames.some((frame) => String(frame.transform).includes('translateY(-1.5px)'));
-          checks.messageEntryEasesChatHeight = animationsOf(streamContent).some((animation) => animation.effect?.getKeyframes().some((frame) => {
+          checks.messageEntrySettlesWithTinyBounce = entryFrames.some((frame) => Number(frame.opacity) === 1 && String(frame.transform).includes('translateY(-1.5px)'));
+          checks.messageEntryEasesChatHeight = streamTimeline.getAnimations().some((animation) => animation.effect?.getKeyframes().some((frame) => {
             const transform = String(frame.transform);
             return transform.startsWith('translateY(') && Number.parseFloat(transform.slice('translateY('.length)) > 0;
           }));
+          checks.messageEntryRisesWithTimeline = streamTimeline.firstElementChild.getAnimations().length === 0
+            && enteringRow.querySelector('[data-testid="user-message"]').getAnimations().length === 0;
           const workingHost = streamChat.querySelector('[data-testid="agent-chat-content"]').lastElementChild;
           workingHost.innerHTML = '<div data-testid="turn-working-indicator">Working</div>';
           await wait(30);
@@ -169,13 +173,26 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           delayedAssistantRow.removeAttribute('style');
           await wait(30);
           checks.delayedAssistantUsesTokenMotionOnly = delayedAssistantRow.getAnimations().length === 0;
+          delayedAssistant.setAttribute('data-cp-streaming-assistant', 'true');
+          delayedAssistantRow.querySelector('.enrm-text').innerHTML = '<div data-paseo-markdown-tag="body"><div data-paseo-markdown-tag="h1"><span dir="auto"><span data-cp-stream-token="true">Heading</span></span></div><div data-paseo-markdown-tag="p"><span dir="auto">Line one wraps into multiple lines as streaming tokens continue arriving across the narrow viewport width</span></div></div>';
+          requestAnimationFrame(() => { streamChat.scrollTop = streamChat.scrollHeight; });
+          await wait(30);
+          const headingTokenStyle = getComputedStyle(delayedAssistantRow.querySelector('[data-paseo-markdown-tag="h1"] [data-cp-stream-token]'));
+          checks.streamingHeadingTokenKeepsHeadingMetrics = headingTokenStyle.fontSize === '24px'
+            && Math.abs(Number.parseFloat(headingTokenStyle.lineHeight) - 24 * 1.3) < 0.5;
+          checks.streamingNewLineAfterUserEntryRisesEntireTimeline = streamTimeline.getAnimations().some((animation) =>
+            animation.effect?.getKeyframes().some((frame) => {
+              const transform = String(frame.transform);
+              return transform.startsWith('translateY(') && Number.parseFloat(transform.slice('translateY('.length)) > 0;
+            })) && delayedAssistantRow.getAnimations().length === 0;
+          delayedAssistant.removeAttribute('data-cp-streaming-assistant');
           document.getElementById('stream-text').firstChild.nodeValue = 'Hello world!';
           await wait(30);
           checks.completedTextStaysStill = !document.querySelector('[data-cp-stream-reveal]');
           const hydrationChat = document.createElement('div');
           hydrationChat.dataset.testid = 'agent-chat-scroll';
           hydrationChat.style = 'width:220px;height:120px;overflow:auto';
-          hydrationChat.innerHTML = '<div data-testid="agent-chat-content"><div data-testid="agent-chat-timeline"></div></div>';
+          hydrationChat.innerHTML = '<div data-testid="agent-chat-content"><div data-testid="agent-chat-timeline"><div style="height:160px;flex-shrink:0"></div></div></div>';
           document.body.appendChild(hydrationChat);
           await wait(30);
           const hydratedRow = document.createElement('div');
@@ -183,15 +200,111 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           hydratedRow.innerHTML = '<div data-testid="user-message">Existing prompt</div>';
           const hydrationTimeline = hydrationChat.querySelector('[data-testid="agent-chat-timeline"]');
           hydrationTimeline.appendChild(hydratedRow);
+          requestAnimationFrame(() => { hydrationChat.scrollTop = hydrationChat.scrollHeight; });
           await wait(30);
           checks.hydrationDoesNotAnimate = !hydratedRow.getAnimations().some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
+          await wait(550);
+          const hydrationContent = hydrationChat.querySelector('[data-testid="agent-chat-content"]');
+          const rehydratedRow = hydratedRow.cloneNode(true);
+          rehydratedRow.innerHTML = '<div data-testid="user-message" style="height:88px">Existing prompt restored from cached content</div>';
+          hydratedRow.replaceWith(rehydratedRow);
+          requestAnimationFrame(() => { hydrationChat.scrollTop = hydrationChat.scrollHeight; });
+          await wait(30);
+          checks.sameIdentityRehydrationStaysStill = rehydratedRow.getAnimations().length === 0;
+          const restoredFooter = document.createElement('div');
+          restoredFooter.style.height = '32px';
+          restoredFooter.innerHTML = '<div><button data-testid="assistant-fork-menu-trigger" aria-label="Fork"></button></div><span>Worked for 2m 14s</span>';
+          hydrationChat.scrollTop = hydrationChat.scrollHeight;
+          const footerScrollBefore = hydrationChat.scrollTop;
+          hydrationContent.appendChild(restoredFooter);
+          requestAnimationFrame(() => { hydrationChat.scrollTop = hydrationChat.scrollHeight; });
+          await wait(30);
+          const footerRise = animationsOf(hydrationContent).find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          const footerRiseStart = Number.parseFloat(String(footerRise?.effect?.getKeyframes()[0]?.transform).slice('translateY('.length));
+          const footerScrollDelta = hydrationChat.scrollTop - footerScrollBefore;
+          checks.postHydrationFooterEasesWithoutJump = restoredFooter.getAnimations().length === 0
+            && footerScrollDelta > 0 && Math.abs(footerRiseStart - footerScrollDelta) < 1;
+          await wait(550);
+          hydrationChat.scrollTop = hydrationChat.scrollHeight;
+          hydrationChat.dispatchEvent(new Event('scroll'));
+          const rehydratedMessage = rehydratedRow.querySelector('[data-testid="user-message"]');
+          rehydratedMessage.style.height = '148px';
+          rehydratedMessage.textContent = 'Existing prompt restored in place after cached content arrives';
+          requestAnimationFrame(() => { hydrationChat.scrollTop = hydrationChat.scrollHeight; });
+          await wait(30);
+          checks.inPlaceRehydrationDoesNotBounceTimeline = !animationsOf(hydrationContent).some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          hydrationChat.remove();
+          const submitChat = document.createElement('div');
+          submitChat.dataset.testid = 'agent-chat-scroll';
+          submitChat.style = 'width:220px;height:120px;overflow:auto';
+          submitChat.innerHTML = '<div data-testid="agent-chat-content"><div data-testid="agent-chat-timeline"><div style="height:160px;flex-shrink:0"></div></div></div>';
+          document.body.appendChild(submitChat);
+          await wait(30);
+          const submitTimeline = submitChat.querySelector('[data-testid="agent-chat-timeline"]');
+          const submitHydratedRow = document.createElement('div');
+          submitHydratedRow.dataset.historyRowId = 'submit-hydrated-row';
+          submitHydratedRow.innerHTML = '<div data-testid="user-message">Existing prompt</div>';
+          submitTimeline.appendChild(submitHydratedRow);
+          requestAnimationFrame(() => { submitChat.scrollTop = submitChat.scrollHeight; });
+          await wait(580);
+          const submitRehydratedRow = submitHydratedRow.cloneNode(true);
+          submitRehydratedRow.innerHTML = '<div data-testid="user-message" style="height:88px">Existing prompt restored from cached content</div>';
+          submitHydratedRow.replaceWith(submitRehydratedRow);
+          requestAnimationFrame(() => { submitChat.scrollTop = submitChat.scrollHeight; });
+          await wait(30);
+          const submitContent = submitChat.querySelector('[data-testid="agent-chat-content"]');
           const promptAfterHydration = document.createElement('div');
           promptAfterHydration.dataset.historyRowId = 'prompt-after-hydration';
-          promptAfterHydration.innerHTML = '<div data-testid="user-message">A new prompt</div>';
-          hydrationTimeline.appendChild(promptAfterHydration);
+          promptAfterHydration.innerHTML = '<div data-testid="user-message" style="height:44px">A new prompt</div>';
+          submitChat.scrollTop = submitChat.scrollHeight;
+          const idleScrollBeforePrompt = submitChat.scrollTop;
+          submitTimeline.appendChild(promptAfterHydration);
+          requestAnimationFrame(() => { submitChat.scrollTop = submitChat.scrollHeight; });
           await wait(30);
           checks.newPromptAfterHydrationEases = promptAfterHydration.getAnimations().some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
-          hydrationChat.remove();
+          const idlePromptRise = animationsOf(submitTimeline).find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          const idlePromptRiseStart = Number.parseFloat(String(idlePromptRise?.effect?.getKeyframes()[0]?.transform).slice('translateY('.length));
+          const idlePromptScrollDelta = submitChat.scrollTop - idleScrollBeforePrompt;
+          checks.idleSubmitEasingStartsWithoutJump = idlePromptScrollDelta > 0 && Math.abs(idlePromptRiseStart - idlePromptScrollDelta) < 1;
+          submitChat.remove();
+          const nativeChat = document.createElement('div');
+          nativeChat.dataset.testid = 'agent-chat-scroll';
+          nativeChat.style = 'width:220px;height:120px;overflow:auto';
+          nativeChat.innerHTML = '<div style="display:flex;flex-direction:column;min-height:100%"><div data-testid="older-history-slot"></div><div style="position:relative;width:100%"><div style="height:160px;flex-shrink:0"></div></div></div>';
+          document.body.appendChild(nativeChat);
+          await wait(30);
+          const nativeContent = nativeChat.firstElementChild;
+          const nativeTimeline = nativeContent.lastElementChild;
+          const prunedTurnRow = document.createElement('div');
+          prunedTurnRow.dataset.historyRowId = 'pruned-turn-user';
+          prunedTurnRow.innerHTML = '<div data-testid="user-message" style="height:28px">Old prompt</div>';
+          const survivingTurnRow = document.createElement('div');
+          survivingTurnRow.dataset.historyRowId = 'surviving-turn-reply';
+          survivingTurnRow.innerHTML = '<div data-testid="assistant-message" style="height:64px">Recent reply</div>';
+          nativeTimeline.append(prunedTurnRow, survivingTurnRow);
+          requestAnimationFrame(() => { nativeChat.scrollTop = nativeChat.scrollHeight; });
+          await wait(580);
+          nativeChat.scrollTop = nativeChat.scrollHeight;
+          const nativeScrollBefore = nativeChat.scrollTop;
+          prunedTurnRow.remove();
+          const nativeUserRow = document.createElement('div');
+          nativeUserRow.dataset.historyRowId = 'native-new-user-row';
+          nativeUserRow.innerHTML = '<div data-testid="user-message" style="height:56px">New prompt in Paseo DOM</div>';
+          nativeTimeline.appendChild(nativeUserRow);
+          nativeChat.scrollTop = nativeChat.scrollHeight;
+          nativeChat.dispatchEvent(new Event('scroll'));
+          const nativeScrollAfterFirstFollow = nativeChat.scrollTop;
+          requestAnimationFrame(() => { nativeChat.scrollTop = nativeChat.scrollHeight; });
+          await wait(30);
+          const nativeRise = nativeTimeline.getAnimations().find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          const nativeRiseStart = Number.parseFloat(String(nativeRise?.effect?.getKeyframes()[0]?.transform).slice('translateY('.length));
+          const nativeScrollDelta = nativeChat.scrollTop - nativeScrollBefore;
+          checks.nativeDomUserMessageEntersSmoothlyWithoutJump = nativeContent.style.overflow === 'clip'
+            && nativeChat.scrollTop === nativeScrollAfterFirstFollow
+            && nativeUserRow.getAnimations().some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY(-1.5px)')))
+            && survivingTurnRow.getAnimations().length === 0
+            && nativeScrollDelta > 0 && Math.abs(nativeRiseStart - nativeScrollDelta) < 1;
+          nativeChat.remove();
           motionEnabled = false;
           document.documentElement.dataset.cpRtMotion = 'off';
           syncMotion();
@@ -272,6 +385,25 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           await wait(30);
           checks.restoredDisclosureDoesNotReplayEntrance = restoredDisclosure.getAnimations().length === 0;
           restoredDisclosure.remove();
+          const outerDisclosure = document.createElement('div');
+          outerDisclosure.dataset.cpExpand = 'open';
+          outerDisclosure.dataset.cpExpandRestored = '';
+          outerDisclosure.innerHTML = '<div style="min-height:0;overflow:hidden"><div id="nested-tool-host"></div></div>';
+          document.body.appendChild(outerDisclosure);
+          const nestedDisclosure = document.createElement('div');
+          nestedDisclosure.dataset.cpExpand = 'open';
+          const rememberedClosed = { open: false, restored: true };
+          if (disclosure.shouldRestoreOpenDisclosure(rememberedClosed)) nestedDisclosure.dataset.cpExpandRestored = '';
+          nestedDisclosure.innerHTML = '<div style="min-height:0;overflow:hidden"><div style="height:96px">Nested tool output</div></div>';
+          outerDisclosure.querySelector('#nested-tool-host').appendChild(nestedDisclosure);
+          nestedDisclosure.getBoundingClientRect();
+          const nestedOpening = nestedDisclosure.getAnimations();
+          nestedOpening.forEach((animation) => { animation.pause(); animation.currentTime = 50; });
+          const nestedOpeningHeight = nestedDisclosure.getBoundingClientRect().height;
+          checks.nestedToolDisclosureOpensWithMotion = nestedOpening.length > 0
+            && nestedOpeningHeight > 0 && nestedOpeningHeight < 96;
+          nestedOpening.forEach((animation) => animation.finish());
+          outerDisclosure.remove();
           checks.accordionCloses = true; checks.accordionReverses = true;
           for (const width of [320, 1000]) {
             const fixture = document.createElement('div'); fixture.style.width = width + 'px';
@@ -295,13 +427,14 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
             checks.accordionReverses &&= height() === 0;
             fixture.remove();
           }
-          const smoothExpansion = web.smoothStreamingText();
+          const smoothExpansion = web.installChatMotion();
           const chat = document.createElement('div');
           chat.dataset.testid = 'agent-chat-scroll';
           chat.style = 'width:600px;height:400px;overflow:auto;overflow-anchor:auto';
-          chat.innerHTML = '<div data-testid="agent-chat-content" style="display:flex;flex-direction:column;padding:16px"><div data-testid="agent-chat-timeline"><div style="height:700px;flex-shrink:0;overflow-anchor:none"></div><div data-history-row-id="tool-row" style="flex-shrink:0"><button>Ran command</button><div data-cp-expand="closed"><div style="min-height:0;overflow:hidden"><div style="height:250px;margin:6px 0 12px">Output</div></div></div></div><div data-history-row-id="merged-run-row" style="flex-shrink:0"><div id="merged-run" style="height:24px"><span data-cp-running-label="">Running command</span></div></div><div data-history-row-id="assistant-turn" style="flex-shrink:0"><div data-testid="assistant-message" style="height:36px">Finished reply</div><div id="turn-extras"></div></div></div><div id="completion-host"><div data-testid="turn-working-indicator">Working</div></div></div>';
+          chat.innerHTML = '<div data-testid="agent-chat-content" style="display:flex;flex-direction:column;padding:16px"><div data-testid="agent-chat-timeline"><div style="height:700px;flex-shrink:0;overflow-anchor:none"></div><div data-history-row-id="tool-row" style="flex-shrink:0"><button>Ran command</button><div data-cp-expand="closed"><div style="min-height:0;overflow:hidden"><div style="height:250px;margin:6px 0 12px">Output</div></div></div></div><div data-history-row-id="merged-run-row" style="flex-shrink:0"><div id="merged-run" style="height:24px"><span data-cp-summary-label="" data-cp-running-label="">Running command</span></div></div><div data-history-row-id="assistant-turn" style="flex-shrink:0"><div data-testid="assistant-message" style="height:36px">Finished reply</div><div id="turn-extras"></div></div></div><div id="completion-host"><div data-testid="turn-working-indicator">Working</div></div></div>';
           document.body.appendChild(chat);
           const content = chat.firstElementChild, expanding = chat.querySelector('[data-cp-expand]');
+          const toolTimeline = chat.querySelector('[data-testid="agent-chat-timeline"]');
           chat.scrollTop = chat.scrollHeight; await wait();
           chat.dispatchEvent(new WheelEvent('wheel', { deltaY: -80, bubbles: true }));
           chat.scrollTop -= 80;
@@ -322,31 +455,46 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           await wait(30);
           const mountedToolLineJump = mountedToolLineBeforeDetails - mountedToolLine.getBoundingClientRect().top;
           checks.detailsInMountedToolEaseLinesAbove = mountedToolLineJump >= 0 && mountedToolLineJump < 20
-            && animationsOf(content).some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
+            && animationsOf(toolTimeline).some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
           await wait(800);
           chat.scrollTop = chat.scrollHeight;
           await wait(30);
-          const toolTimeline = chat.querySelector('[data-testid="agent-chat-timeline"]');
           const arrivingTool = document.createElement('div');
           arrivingTool.dataset.historyRowId = 'arriving-tool-row';
           arrivingTool.innerHTML = '<div data-testid="tool-call-badge"><button><span data-cp-part="row-label">Ran another command</span></button><div style="height:48px">New tool details</div></div>';
           toolTimeline.appendChild(arrivingTool);
           requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
           await wait(30);
-          const toolRiseAnimation = animationsOf(content).find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          const toolRiseAnimation = animationsOf(toolTimeline).find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
           const toolRiseFrames = toolRiseAnimation?.effect?.getKeyframes() ?? [];
           const toolViewportRise = Math.abs(Number.parseFloat(String(toolRiseFrames[0]?.transform).slice('translateY('.length)));
           const toolSummaryAnimations = arrivingTool.querySelector('[data-cp-part="row-label"]').getAnimations();
           const toolSummaryFrames = toolSummaryAnimations.flatMap((animation) => animation.effect?.getKeyframes() ?? []);
           checks.toolSummaryViewportGetsLead = toolViewportRise > arrivingTool.getBoundingClientRect().height + 3;
-          checks.toolSummaryLineRisesAfterViewport = toolSummaryAnimations.some((animation) => Number(animation.effect?.getTiming().delay) >= 16)
-            && toolSummaryFrames.some((frame) => Number(frame.opacity) < 1 && String(frame.transform).includes('translateY(4px)'));
+          checks.toolSummaryLineRisesAfterViewport = toolSummaryAnimations.some((animation) => Number(animation.effect?.getTiming().delay) >= 150)
+            && toolSummaryFrames.some((frame) => Number(frame.opacity) === 0 && String(frame.transform).includes('translateY(4px)'));
+          animationsOf(content).forEach((animation) => animation.cancel());
+          await wait(450);
+          chat.scrollTop = chat.scrollHeight;
+          chat.dispatchEvent(new Event('scroll'));
+          const pluginTool = document.createElement('div');
+          pluginTool.dataset.historyRowId = 'plugin-tool-row';
+          pluginTool.innerHTML = '<div data-cp-tool-summary="" style="height:32px"><div data-cp-row=""><div data-cp-running-label=""><span>Calling</span><span> Bash</span></div></div></div>';
+          toolTimeline.appendChild(pluginTool);
+          chat.scrollTop = chat.scrollHeight;
+          chat.dispatchEvent(new Event('scroll'));
+          await wait(30);
+          const pluginToolRise = animationsOf(toolTimeline).find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          const pluginToolLineAnimations = pluginTool.querySelector('[data-cp-running-label]').getAnimations();
+          checks.pluginToolSummaryEasesAfterImmediateHostFollow = Boolean(pluginToolRise);
+          checks.pluginToolSummaryLineRisesAfterViewport = pluginToolLineAnimations.some((animation) => Number(animation.effect?.getTiming().delay) >= 150)
+            && pluginToolLineAnimations.some((animation) => animation.effect?.getKeyframes().some((frame) => Number(frame.opacity) === 0 && String(frame.transform).includes('translateY(4px)')));
           animationsOf(content).forEach((animation) => animation.cancel());
           const completionHost = document.getElementById('completion-host');
           completionHost.innerHTML = '<div id="completion-footer"><div><button data-testid="assistant-fork-menu-trigger" aria-label="Fork"></button></div><span>Worked for 8m 40s</span></div>';
           requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
           await wait(30);
-          const hasRise = (surface) => surface.getAnimations().some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
+          const hasRise = (surface) => animationsOf(surface).some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).includes('translateY')));
           checks.completedTurnDetailsEaseChatWithoutMovingFooter = hasRise(toolTimeline) && !hasRise(completionHost);
           animationsOf(content).forEach((animation) => animation.cancel());
           await wait(450);
@@ -359,7 +507,7 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           const recapSummary = turnExtras.querySelector('[data-cp-turn-recap]');
           const recapFrames = recapSummary.getAnimations().flatMap((animation) => animation.effect?.getKeyframes() ?? []);
           checks.turnRecapEasesIntoChat = recapFrames.some((frame) => Number(frame.opacity) < 1 && String(frame.transform).includes('translateY(4px)'))
-            && animationsOf(content).some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+            && animationsOf(toolTimeline).some((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
           animationsOf(content).forEach((animation) => animation.cancel());
           await wait(450);
           chat.scrollTop = chat.scrollHeight;
@@ -370,14 +518,51 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           mergedRun.firstElementChild.removeAttribute('data-cp-running-label');
           mergedRun.firstElementChild.textContent = 'Thought twice and ran four commands';
           mergedRun.style.height = '54px';
-          requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+          chat.scrollTop = chat.scrollHeight;
+          chat.dispatchEvent(new Event('scroll'));
           await wait(30);
           const runHeightDelta = chat.scrollHeight - runHeightBefore;
-          const runRiseAnimation = toolTimeline.getAnimations().find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          const followingTurn = chat.querySelector('[data-history-row-id="assistant-turn"]');
+          const runRiseAnimation = followingTurn.getAnimations().find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
           const runRiseFrame = runRiseAnimation?.effect?.getKeyframes()[0];
           const runViewportRise = Math.abs(Number.parseFloat(String(runRiseFrame?.transform).slice('translateY('.length)));
-          checks.completedToolSummaryGetsViewportLead = runHeightDelta > 0 && runViewportRise > runHeightDelta + 3
-            && mergedRun.getAnimations().length === 0;
+          checks.completedToolSummaryGetsViewportLead = runHeightDelta > 0 && runViewportRise > runHeightDelta + 3;
+          let followingStart = 0, followingMiddle = 0, followingEnd = 0;
+          if (runRiseAnimation) {
+            const duration = Number(runRiseAnimation.effect?.getTiming().duration ?? 0);
+            runRiseAnimation.pause();
+            runRiseAnimation.currentTime = 0;
+            followingStart = followingTurn.getBoundingClientRect().top;
+            runRiseAnimation.currentTime = Math.min(120, duration / 2);
+            followingMiddle = followingTurn.getBoundingClientRect().top;
+            runRiseAnimation.currentTime = duration;
+            followingEnd = followingTurn.getBoundingClientRect().top;
+          }
+          checks.completedToolSummarySlidesFollowingContent = followingStart > followingMiddle && followingMiddle > followingEnd;
+          const completedSummaryAnimations = mergedRun.firstElementChild.getAnimations();
+          const completedSummaryFrames = completedSummaryAnimations.flatMap((animation) => animation.effect?.getKeyframes() ?? []);
+          checks.completedToolSummaryWaitsForTimelineRise = completedSummaryAnimations.some((animation) => Number(animation.effect?.getTiming().delay) >= 150)
+            && completedSummaryFrames.some((frame) => Number(frame.opacity) === 0 && String(frame.transform).includes('translateY(4px)'));
+          checks.completedToolSummarySettlesBeforeAppearing = completedSummaryFrames.some((frame) => Number(frame.opacity) === 0 && String(frame.transform).includes('translateY(0'));
+          const completedSummaryAnimation = completedSummaryAnimations[0];
+          let visibleSummaryTop = 0, settledSummaryTop = 0, visibleSummaryOpacity = 0;
+          if (runRiseAnimation && completedSummaryAnimation) {
+            const riseDuration = Number(runRiseAnimation.effect?.getTiming().duration ?? 0);
+            const summaryTiming = completedSummaryAnimation.effect?.getTiming();
+            const summaryDelay = Number(summaryTiming?.delay ?? 0);
+            const summaryDuration = Number(summaryTiming?.duration ?? 0);
+            runRiseAnimation.pause();
+            completedSummaryAnimation.pause();
+            runRiseAnimation.currentTime = Math.min(riseDuration, summaryDelay + 32);
+            completedSummaryAnimation.currentTime = summaryDelay + 32;
+            visibleSummaryOpacity = Number(getComputedStyle(mergedRun.firstElementChild).opacity);
+            visibleSummaryTop = mergedRun.firstElementChild.getBoundingClientRect().top;
+            runRiseAnimation.currentTime = riseDuration;
+            completedSummaryAnimation.currentTime = summaryDelay + summaryDuration;
+            settledSummaryTop = mergedRun.firstElementChild.getBoundingClientRect().top;
+          }
+          checks.completedToolSummaryDoesNotMoveOnceVisible = visibleSummaryOpacity > 0
+            && Math.abs(visibleSummaryTop - settledSummaryTop) <= 0.5;
           // Paseo 0.11.4 follows content resizing in the next animation frame.
           let hostFollowing = true;
           const hostFollow = new ResizeObserver(() => requestAnimationFrame(() => {
@@ -457,7 +642,7 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
     assert.equal(report.error, undefined, report.error);
     assert.deepEqual(report.errors, []);
     assert.deepEqual(Object.entries(report.checks).filter(([, passed]) => !passed).map(([check]) => check), []);
-    assert.equal(Object.keys(report.checks).length, 48);
+    assert.equal(Object.keys(report.checks).length, 64);
   } finally {
     server?.closeAllConnections(); server?.close();
     rmSync(temp, { recursive: true, force: true });

@@ -1,27 +1,15 @@
-const STREAMING_TAIL = Symbol("native polish streaming markdown tail");
+import type MarkdownIt from "markdown-it";
+import type { MarkdownDelimiter, MarkdownInlineState, MarkdownToken } from "markdown-it";
 
-interface InlineState {
-  src: string;
-  pos: number;
-  posMax: number;
-  pending: string;
-  level: number;
-  env: Record<PropertyKey, unknown>;
-  tokens: any[];
-  delimiters: any[];
-  md: any;
-  push: (type: string, tag: string, nesting: number) => any;
-  pushPending: () => void;
-  scanDelims: (start: number, canSplitWord: boolean) => { can_close: boolean };
-}
+const STREAMING_TAIL = Symbol("native polish streaming markdown tail");
 
 /**
  * Mirrors Paseo core's provisional Markdown rules so incomplete stream tails
  * never flash as literal syntax before their closing delimiter arrives.
  */
-export function enableStreamingMarkdown(parser: any): void {
-  parser.core.ruler.at("inline", (state: any) => {
-    let tail: any = null;
+export function enableStreamingMarkdown(parser: MarkdownIt): void {
+  parser.core.ruler.at("inline", (state) => {
+    let tail: MarkdownToken | null = null;
     for (const token of state.tokens) {
       if (token.nesting !== -1) tail = token;
     }
@@ -36,7 +24,7 @@ export function enableStreamingMarkdown(parser: any): void {
   parser.inline.ruler.before("strikethrough", "streaming_marker", hideOpeningMarker);
   parser.inline.ruler.after("image", "streaming_link", completeLink);
   parser.inline.ruler2.after("balance_pairs", "streaming_emphasis", completeEmphasis);
-  parser.core.ruler.after("linkify", "streaming_link_text", (state: any) => {
+  parser.core.ruler.after("linkify", "streaming_link_text", (state) => {
     for (const block of state.tokens) {
       for (const token of block.children ?? []) {
         if (token.type === "streaming_link_text") token.type = "text";
@@ -45,11 +33,11 @@ export function enableStreamingMarkdown(parser: any): void {
   });
 }
 
-function isStreamingTail(state: InlineState): boolean {
+function isStreamingTail(state: MarkdownInlineState): boolean {
   return state.env[STREAMING_TAIL] === true && state.posMax === state.src.length;
 }
 
-function hideOpeningMarker(state: InlineState, silent: boolean): boolean {
+function hideOpeningMarker(state: MarkdownInlineState, silent: boolean): boolean {
   if (silent || !isStreamingTail(state)) return false;
   if (!/^(?:\*{1,3}|_{1,3}|~{1,2})$/.test(state.src.slice(state.pos))) return false;
   if (state.scanDelims(state.pos, state.src[state.pos] !== "_").can_close) return false;
@@ -57,7 +45,7 @@ function hideOpeningMarker(state: InlineState, silent: boolean): boolean {
   return true;
 }
 
-function completeCode(state: InlineState, silent: boolean): boolean {
+function completeCode(state: MarkdownInlineState, silent: boolean): boolean {
   if (silent || !isStreamingTail(state) || state.src[state.pos] !== "`") return false;
   const runs = /`+/g;
   runs.lastIndex = state.pos;
@@ -80,7 +68,7 @@ function completeCode(state: InlineState, silent: boolean): boolean {
   return true;
 }
 
-function completeLink(state: InlineState, silent: boolean): boolean {
+function completeLink(state: MarkdownInlineState, silent: boolean): boolean {
   if (silent || !isStreamingTail(state)) return false;
   const image = state.src[state.pos] === "!";
   const start = state.pos + (image ? 1 : 0);
@@ -132,9 +120,9 @@ function hasClosedDestination(source: string, start: number): boolean {
   return false;
 }
 
-function completeEmphasis(state: InlineState): boolean {
+function completeEmphasis(state: MarkdownInlineState): boolean {
   if (!isStreamingTail(state)) return false;
-  const open: any[] = [];
+  const open: MarkdownDelimiter[] = [];
   let closedThrough = -1;
   for (const [index, delimiter] of state.delimiters.entries()) {
     if (delimiter.end !== -1) {

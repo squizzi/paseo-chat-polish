@@ -2,6 +2,7 @@ import { createElement, useEffect, useLayoutEffect, useMemo, useRef, useState } 
 import { openExternalUrl } from "@getpaseo/plugin/client";
 import { htmlPage, themeCss, type HtmlColors } from "../shared/page.ts";
 import { FRAME_SANDBOX, fitFrame, frameKey, frameLink, frameReport, heightAt } from "./html.ts";
+import { CHAT_MONO_FALLBACK } from "./chat-markdown-style";
 import { readHostAppearance, seriesFrom } from "./web";
 
 // Web only (views.tsx checks Platform.OS); just the DOM this module touches.
@@ -33,13 +34,12 @@ export const lastFrameHeight = (id: string, heights?: ReadonlyArray<readonly [nu
 const SHRINK_AFTER_MS = 400;
 
 const SANS = '-apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif';
-const MONO = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
 
 /** The CSS variables a page gets from the app's theme and fonts. */
 export function useHtmlTheme(colors: HtmlColors) {
   return useMemo(() => {
     const a = readHostAppearance();
-    return themeCss(colors, { sans: a.uiFont ? `${a.uiFont}, ${SANS}` : SANS, mono: a.monoFont ? `${a.monoFont}, ${MONO}` : MONO }, seriesFrom(colors.accent));
+    return themeCss(colors, { sans: a.uiFont ? `${a.uiFont}, ${SANS}` : SANS, mono: a.monoFont ? `${a.monoFont}, ${CHAT_MONO_FALLBACK}` : CHAT_MONO_FALLBACK }, seriesFrom(colors.accent));
   }, [colors]);
 }
 

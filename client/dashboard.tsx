@@ -14,7 +14,9 @@ import { setTodoChanges } from "./steps";
 import { PrefsOverride, setPrefs, usePrefs } from "./prefs";
 import { registerTheme, useCurrentTheme } from "./theme-registry";
 import { PLAIN_SYNTAX, SYNTAX_THEMES } from "./highlight";
-import { alpha, AppearanceOverride, CodeLine, HtmlItem, ImagesItem, MergedSteps, PMONO, sunken, SyntaxOverride, ThoughtItem, TodoItem, ToolItem, useReducedMotion, useStyles } from "./views";
+import { CHAT_MARKDOWN_VISUAL } from "./chat-markdown-style";
+import { alpha, sunken } from "./color";
+import { AppearanceOverride, CodeLine, HtmlItem, ImagesItem, MergedSteps, PMONO, SyntaxOverride, ThoughtItem, TodoItem, ToolItem, useReducedMotion, useStyles } from "./views";
 import { canSetAppTheme, DEFAULTS, diagramDoc, drawDiagram, loadMermaidDoc, PASEO_FONT_STACKS, readHostAppearance, readSyntaxTheme, setAppTheme, updateAppSettings } from "./web";
 
 type ToolCall = Extract<AgentTimelineItem, { type: "tool_call" }>;
@@ -1688,7 +1690,7 @@ function InlineCode({ theme, variant, children }: { theme: PluginTheme; variant:
   const c = theme.colors;
   const box = { a: { backgroundColor: c.surface2 }, b: {}, c: { borderWidth: 1, borderColor: alpha(c.border, 0.6) } }[variant];
   return (
-    <View style={[{ paddingHorizontal: variant === "b" ? 0 : 5, paddingVertical: 1, borderRadius: 4 }, box]}>
+    <View style={[{ paddingHorizontal: variant === "b" ? 0 : CHAT_MARKDOWN_VISUAL.inlinePadding.horizontal, paddingVertical: 1, borderRadius: CHAT_MARKDOWN_VISUAL.inlineRadius }, box]}>
       <Text {...PMONO} style={[s.code, { color: variant === "b" ? c.statusWarning : c.foreground }]}>{children}</Text>
     </View>
   );
@@ -1763,10 +1765,10 @@ function RichSample({ theme, rt, pele }: { theme: PluginTheme; rt: Prefs["richTe
 
   const heading = (level: 1 | 2 | 3, text: string) => {
     if (rt.heading === "b") {
-      const size = [18, 15, 12][level - 1]!;
-      return <Text style={[s.title, { fontSize: size, color: level === 3 ? c.foregroundMuted : c.foreground, ...(level === 3 ? { textTransform: "uppercase", letterSpacing: 0.7 } : {}), ...(level === 1 ? { paddingBottom: 6, borderBottomWidth: 1, borderBottomColor: rule } : {}) }]}>{text}</Text>;
+      const size = CHAT_MARKDOWN_VISUAL.headingSizes.compact[level - 1]!;
+      return <Text style={[s.title, { fontSize: size, color: level === 3 ? c.foregroundMuted : c.foreground, ...(level === 3 ? { textTransform: "uppercase", letterSpacing: 0.7 } : {}), ...(level === 1 ? { paddingBottom: CHAT_MARKDOWN_VISUAL.headingUnderlinePadding, borderBottomWidth: 1, borderBottomColor: rule } : {}) }]}>{text}</Text>;
     }
-    const title = <Text style={[s.title, { fontSize: [24, 20, 16][level - 1]! }]}>{text}</Text>;
+    const title = <Text style={[s.title, { fontSize: CHAT_MARKDOWN_VISUAL.headingSizes.standard[level - 1]! }]}>{text}</Text>;
     if (rt.heading === "a") return title;
     return (
       <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
@@ -1780,13 +1782,13 @@ function RichSample({ theme, rt, pele }: { theme: PluginTheme; rt: Prefs["richTe
     const text = "Never read the token before refresh() runs — it may already be rotated.";
     if (rt.quote === "b")
       return (
-        <View style={{ flexDirection: "row", gap: 10, padding: 12, borderRadius: 8, backgroundColor: c.surface1 }}>
+        <View style={{ flexDirection: "row", gap: 10, padding: 12, borderRadius: CHAT_MARKDOWN_VISUAL.blockRadius, backgroundColor: c.surface1 }}>
           <Text style={[s.title, { fontSize: 20, lineHeight: 22, color: c.accent }]}>“</Text>
           <Text style={[prose, { flex: 1 }]}>{text}</Text>
         </View>
       );
     return (
-      <View style={rt.quote === "a" ? { borderLeftWidth: 2, borderLeftColor: c.accent, paddingLeft: 14 } : { paddingLeft: 20 }}>
+      <View style={rt.quote === "a" ? { borderLeftWidth: CHAT_MARKDOWN_VISUAL.quote.border, borderLeftColor: c.accent, paddingLeft: CHAT_MARKDOWN_VISUAL.quote.indent } : { paddingLeft: CHAT_MARKDOWN_VISUAL.quote.plainIndent }}>
         <Text style={[muted, { fontStyle: "italic" }]}>{text}</Text>
       </View>
     );
@@ -1846,7 +1848,7 @@ function RichSample({ theme, rt, pele }: { theme: PluginTheme; rt: Prefs["richTe
     rt.rule === "b" ? (
       <Text style={[s.small, { textAlign: "center", letterSpacing: 3 }]}>• • •</Text>
     ) : (
-      <View style={{ height: 1, width: rt.rule === "c" ? 48 : "100%", backgroundColor: rt.rule === "c" ? c.border : rule }} />
+          <View style={{ height: 1, width: rt.rule === "c" ? CHAT_MARKDOWN_VISUAL.ruleWidth : "100%", backgroundColor: rt.rule === "c" ? c.border : rule }} />
     );
 
   const widths = [3, 2, 0.6, 0.6];
@@ -1869,7 +1871,7 @@ function RichSample({ theme, rt, pele }: { theme: PluginTheme; rt: Prefs["richTe
   // Grid cells carry their own padding so the column rules run the full row height.
   const rowPad = grid ? { gap: 0 } : { gap: 12, paddingHorizontal: rt.table === "c" ? 0 : 12, paddingVertical: 8 };
   const table = (
-    <View style={bordered ? { borderRadius: 8, borderWidth: 1, borderColor: rule, overflow: "hidden" } : { gap: rt.table === "b" ? 2 : 0 }}>
+    <View style={bordered ? { borderRadius: CHAT_MARKDOWN_VISUAL.blockRadius, borderWidth: 1, borderColor: rule, overflow: "hidden" } : { gap: rt.table === "b" ? 2 : 0 }}>
       <View style={{ flexDirection: "row", ...rowPad, backgroundColor: bordered ? c.surface1 : undefined, borderBottomWidth: rt.table === "b" ? 0 : 1, borderBottomColor: rule }}>
         {["File", "Change", "+", "-"].map((t, i) => cell(t, i, true))}
       </View>
@@ -1907,7 +1909,7 @@ function RichSample({ theme, rt, pele }: { theme: PluginTheme; rt: Prefs["richTe
     </View>
   );
   const codeBlock = (
-    <View style={{ borderRadius: 8, backgroundColor: rt.code === "c" ? undefined : sunken(c.surface0), borderWidth: rt.code === "b" ? 0 : 1, borderColor: rule }}>
+    <View style={{ borderRadius: CHAT_MARKDOWN_VISUAL.blockRadius, backgroundColor: rt.code === "c" ? undefined : sunken(c.surface0), borderWidth: rt.code === "b" ? 0 : 1, borderColor: rule }}>
       {rt.code === "a" ? (
         <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: rule }}>
           <Text {...PMONO} style={[s.code, { flex: 1, fontSize: 12, color: c.foregroundMuted }]}>typescript</Text>

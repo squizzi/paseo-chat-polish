@@ -2,7 +2,18 @@ import { Platform } from "react-native";
 import { BOT_ICON, PROVIDER_ICONS } from "./provider-icons";
 import { guardPositional, POSITIONAL, splitTop } from "./css-guard";
 import { shouldQueueMessageEntrance } from "./message-entry-motion";
-import { CHAT_MARKDOWN_DENSITY, CHAT_MARKDOWN_LINE_HEIGHT } from "./chat-markdown-style";
+import {
+  CHAT_IMAGE_FRAMES,
+  CHAT_MARKDOWN_CODE_LINE_HEIGHT,
+  CHAT_MARKDOWN_DENSITY,
+  CHAT_MARKDOWN_LINE_HEIGHT,
+  CHAT_MARKDOWN_VISUAL,
+  CHAT_MONO_FALLBACK,
+  CHAT_ROW_QUIET,
+  CHAT_ROW_TIGHT,
+  CHAT_UI_FALLBACK,
+} from "./chat-markdown-style";
+import { alpha, sunken } from "./color";
 import { STREAM_TOKEN_FADE_MS, STREAM_TOKEN_PREROLL_MS } from "./streaming-token-motion";
 
 declare const localStorage: { getItem(key: string): string | null; setItem(key: string, value: string): void };
@@ -207,7 +218,7 @@ export function setAppTheme(catalogId: string, extra: Record<string, unknown> = 
  * ponytail: copied from Paseo 0.11.x (DEFAULT_UI_FONT_STACK / DEFAULT_MONO_FONT_STACK); update if Paseo changes them.
  */
 export const PASEO_FONT_STACKS = {
-  ui: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+  ui: CHAT_UI_FALLBACK,
   mono: "SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
 };
 
@@ -327,32 +338,39 @@ const CHAT_TIMELINE = '[data-testid="agent-chat-timeline"]';
 const HISTORY_ROW = "[data-history-row-id]";
 const WORKING = '[data-testid="turn-working-indicator"]';
 const REPLY = '[data-testid="assistant-message"]';
+const STREAMING_REPLY = "[data-cp-streaming-assistant]";
+const TURN_FOOTER_DETAILS = '[data-testid="assistant-fork-menu-trigger"]';
 const TURN_RECAP = "[data-cp-turn-recap]";
 const RUN_SUMMARY = "[data-cp-run-summary]";
+const PLUGIN_TOOL_SUMMARY = "[data-cp-tool-summary]";
 const MESSAGE_ENTRY_MOTION = "data-cp-message-entry-motion";
 const chatDisclosureQuietUntil = new WeakMap<DomElement, number>();
 const cancelChatRise = new WeakMap<DomElement, () => void>();
 
 interface ContentRise {
-  start(distance: number): void;
-  prepare(distance: number): void;
+  start(distance: number, stationary?: DomElement[]): void;
+  prepare(distance: number, stationary?: DomElement[]): void;
   cancel(): void;
   dispose(): void;
 }
 
 interface ChatMotionState {
   seen: Set<string>;
+  seenToolSummaryRows: Set<string>;
   seenRecapRows: Set<string>;
   seenRunSummaryRows: Set<string>;
   pending: Set<string>;
   pendingTools: Set<string>;
   pendingRunSummaries: Set<string>;
+  arrivalRows: Map<string, number>;
   running: boolean;
   scrollTop: number;
   compensatedScrollTop: number;
   maxScrollTop: number;
   clientWidth: number;
   toolLeadUntil: number;
+  entryRiseUntil: number;
+  liveLayoutUntil: number;
   hydrationQuietUntil: number;
   reflowQuietUntil: number;
 }
@@ -362,15 +380,41 @@ interface ChatMotionState {
 // distance, but spent most of it before the arriving text became visible.
 const CHAT_RISE_DECAY_MS = 150;
 const TOOL_SUMMARY_SCROLL_LEAD_PX = 6;
-const TOOL_SUMMARY_ENTRY_DELAY_MS = 32;
+const TOOL_SUMMARY_ENTRY_DELAY_MS = 160;
+
+const chatContentOf = (chat: DomElement): DomElement | null => {
+  const explicit = chat.querySelector(CHAT_CONTENT);
+  if (explicit) return explicit;
+  const first = chat.firstElementChild;
+  if (!first || first.matches(HISTORY_ROW) || first.matches(CHAT_TIMELINE)) return null;
+  return first;
+};
+
+const chatTimelineOf = (content: DomElement): DomElement | null => {
+  const explicit = content.querySelector(CHAT_TIMELINE);
+  if (explicit) return explicit;
+  const firstRow = content.querySelector(HISTORY_ROW);
+  if (firstRow) {
+    let current = firstRow.parentElement;
+    while (current && current !== content && current.parentElement !== content) {
+      current = current.parentElement;
+    }
+    return current ?? content;
+  }
+  const olderSlot = content.querySelector('[data-testid="older-history-slot"]');
+  if (olderSlot?.nextElementSibling) return olderSlot.nextElementSibling;
+  return content.firstElementChild;
+};
 
 function contentRise(element: DomElement): ContentRise {
   let offset = 0;
   let startedAt = 0;
   let active: DomAnimation[] = [];
+  const stationaryTargets = new Set<DomElement>();
   let generation = 0;
   const originalOverflow = element.style.getPropertyValue("overflow");
-  const layered = element.matches(CHAT_CONTENT);
+  const layered = element.matches(CHAT_CONTENT)
+    || Boolean(element.parentElement?.matches(CHAT) && !element.matches(HISTORY_ROW) && !element.matches(CHAT_TIMELINE));
   element.setAttribute("data-cp-stream-rise", "");
   const currentOffset = () => {
     if (!active.length) return 0;
@@ -387,8 +431,10 @@ function contentRise(element: DomElement): ContentRise {
     for (const animation of active) animation.cancel();
     active = [];
   };
-  const begin = (distance: number, holdFirstFrame: boolean) => {
+  const begin = (distance: number, holdFirstFrame: boolean, stationary: DomElement[] = []) => {
     if (!Number.isFinite(distance) || Math.abs(distance) <= 0.5) return;
+    stationaryTargets.clear();
+    for (const target of stationary) stationaryTargets.add(target);
     // Retarget from the decay's authoritative value, never from a sampled
     // computed transform. Consecutive chunks therefore add momentum without
     // restarting from a stale browser frame.
@@ -396,11 +442,24 @@ function contentRise(element: DomElement): ContentRise {
     stopAnimations();
     if (Math.abs(next) <= 0.5) return restoreOverflow();
     // Transforming the scroll-height owner expands its scrollable overflow,
-    // causing the host's bottom follow to move twice. Animate only the timeline
-    // inside a clipped, layout-stable surface. The Working/Worked footer is a
-    // sibling and must remain locked at the bottom of the laid-out content.
-    const timeline = layered ? element.querySelector(CHAT_TIMELINE) : null;
-    const targets = layered ? (timeline ? [timeline] : []) : [element];
+    // causing the host's bottom follow to move twice. Animate inside a clipped,
+    // layout-stable surface. For a logical arrival, animate the timeline's
+    // existing children individually so the new row stays at its final position.
+    const timeline = layered ? chatTimelineOf(element) : null;
+    const stationaryRoots = new Set<DomElement>();
+    if (timeline) for (const target of stationaryTargets) {
+      let root = target;
+      while (root.parentElement && root.parentElement !== timeline) root = root.parentElement;
+      if (root.parentElement === timeline) stationaryRoots.add(root);
+    }
+    const hasActiveMessageEntry = Boolean(timeline?.querySelector(`[${MESSAGE_ENTRY_MOTION}]`));
+    const targets = layered
+      ? timeline
+        ? (stationaryRoots.size && !hasActiveMessageEntry) || timeline === element
+          ? Array.from(timeline.children).filter((child) => !stationaryRoots.has(child) && !child.hasAttribute(MESSAGE_ENTRY_MOTION))
+          : [timeline]
+        : []
+      : [element];
     if (!targets.length || targets.some((target) => !target.animate)) return restoreOverflow();
     if (layered) element.style.setProperty("overflow", "clip");
     offset = next;
@@ -412,13 +471,15 @@ function contentRise(element: DomElement): ContentRise {
       const value = index === steps ? 0 : offset * Math.exp(-(progress * duration) / CHAT_RISE_DECAY_MS);
       return { offset: progress, transform: `translateY(${value}px)` };
     });
-    const animations = targets.map((target) => target.animate!(frames, { duration, delay: holdFirstFrame ? 16 : 0, easing: "linear", fill: "both" }));
+    const options = { duration, delay: holdFirstFrame ? 16 : 0, easing: "linear", fill: "both" } as const;
+    const animations = targets.map((target) => target.animate!(frames, options));
     const ownGeneration = generation;
     active = animations;
     const finish = () => {
       if (generation !== ownGeneration || active !== animations) return;
       active = [];
       offset = 0;
+      stationaryTargets.clear();
       for (const animation of animations) animation.cancel();
       restoreOverflow();
     };
@@ -428,11 +489,12 @@ function contentRise(element: DomElement): ContentRise {
     stopAnimations();
     offset = 0;
     startedAt = 0;
+    stationaryTargets.clear();
     restoreOverflow();
   };
   return {
-    start: (distance) => begin(distance, false),
-    prepare: (distance) => begin(distance, true),
+    start: (distance, stationary) => begin(distance, false, stationary),
+    prepare: (distance, stationary) => begin(distance, true, stationary),
     cancel,
     dispose: () => {
       cancel();
@@ -446,10 +508,16 @@ function contentRise(element: DomElement): ContentRise {
  * renderer. Text paint stays entirely renderer-owned so reflow cannot leave
  * duplicate glyph covers or completion-time handoffs behind.
  */
-export function smoothStreamingText(enabled: () => boolean = () => true, subscribe?: (listener: () => void) => () => void) {
+export function installChatMotion(enabled: () => boolean = () => true, subscribe?: (listener: () => void) => () => void) {
   if (Platform.OS !== "web" || typeof document === "undefined") return () => {};
   const chatStates = new WeakMap<DomElement, ChatMotionState>();
   const chatRises = new WeakMap<DomElement, ContentRise>();
+  // Keyed by the latest history row's stable ID rather than chat state, so a
+  // footer that already settled for a turn stays settled even when a tab
+  // switch tears down and rebuilds the chat scroller. Without this, the
+  // rebuilt scroller's empty state reads the footer's reappearance as a
+  // brand new arrival and replays the rise meant for genuinely new replies.
+  const seenFooterTurnIds = new Set<string>();
   const userScrollUntil = new WeakMap<DomElement, number>();
   const rises = new Set<ContentRise>();
   const entryAnimations = new Map<DomAnimation, () => void>();
@@ -478,25 +546,46 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
     }
     return chats;
   };
-  const historyRemovalChats = (records: DomMutation[]) => {
+  const historyRemountChats = (records: DomMutation[]) => {
     const chats = new Set<DomElement>();
     for (const record of records) {
-      const removedIds = Array.from(record.removedNodes).flatMap((node) => {
+      const removedRows = Array.from(record.removedNodes).flatMap((node) => {
         const element = elementOf(node);
         if (!element) return [];
-        const rows = element.matches(HISTORY_ROW)
+        return element.matches(HISTORY_ROW)
           ? [element]
           : Array.from(element.querySelectorAll(HISTORY_ROW));
-        return rows.map((row) => row.getAttribute("data-history-row-id")).filter((id): id is string => Boolean(id));
       });
-      if (!removedIds.length) continue;
+      // The streaming renderer may repaint its stable row while new tokens
+      // arrive, and @tanstack/react-virtual unmounts data-index rows as the
+      // viewport scrolls. Completed/user rows have neither marker, so replacing
+      // one is a host rehydration boundary even when its history ID survives.
+      const nonStreamingRemoved = removedRows.filter((row) => !row.querySelector(STREAMING_REPLY) && !row.hasAttribute("data-index"));
+      if (!nonStreamingRemoved.length) continue;
       const target = elementOf(record.target);
       const chat = target?.matches(CHAT) ? target : target?.closest(CHAT);
       if (!chat) continue;
-      const currentIds = new Set(Array.from(chat.querySelectorAll(HISTORY_ROW))
-        .map((row) => row.getAttribute("data-history-row-id"))
-        .filter((id): id is string => Boolean(id)));
-      if (removedIds.some((id) => !currentIds.has(id))) chats.add(chat);
+      // During a live turn, Paseo can hide completed read/search rows, fold
+      // step rows into a merged summary, or swap the streaming reply without
+      // rehydrating the chat. Only treat user-row removal or idle history
+      // replacement as a hydration boundary.
+      const liveTurn = Boolean(chat.querySelector(WORKING) || chat.querySelector(STREAMING_REPLY));
+      if (liveTurn && !nonStreamingRemoved.some((row) => Boolean(row.querySelector('[data-testid="user-message"]')))) continue;
+      // When partial virtualization is active, submitting a new message shifts
+      // the mounted recent window forward: the oldest mounted turn is pruned
+      // from the top in the same commit that appends the new user row at the
+      // bottom. Do not mistake top-window pruning for chat rehydration.
+      const old = chatStates.get(chat);
+      const removedIds = new Set(nonStreamingRemoved.map((row) => row.getAttribute("data-history-row-id")).filter((id): id is string => Boolean(id)));
+      const currentRows = Array.from(chat.querySelectorAll(HISTORY_ROW));
+      const currentIds = new Set(currentRows.map((row) => row.getAttribute("data-history-row-id")).filter((id): id is string => Boolean(id)));
+      const sameIdReplaced = Array.from(removedIds).some((id) => currentIds.has(id));
+      const hasSurvivingSeen = Boolean(old && Array.from(currentIds).some((id) => old.seen.has(id) && !removedIds.has(id)));
+      const lastCurrentId = currentRows[currentRows.length - 1]?.getAttribute("data-history-row-id") ?? null;
+      const tailAppendedWhileWindowPruned = Boolean(
+        old && !sameIdReplaced && hasSurvivingSeen && lastCurrentId && !old.seen.has(lastCurrentId) && !removedIds.has(lastCurrentId),
+      );
+      if (!tailAppendedWhileWindowPruned) chats.add(chat);
     }
     return chats;
   };
@@ -531,21 +620,28 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
   };
   const animateSummary = (summary: DomElement) => {
     const recap = summary.matches(TURN_RECAP);
+    const completedRun = summary.matches(RUN_SUMMARY);
+    const pluginSummary = summary.matches(PLUGIN_TOOL_SUMMARY);
     const button = summary.querySelector("button");
     const line = recap
       ? summary
-      : summary.querySelector('[data-cp-part="row-label"]')
+      : completedRun
+        ? summary.querySelector('[data-cp-summary-label]') ?? summary
+      : pluginSummary
+        ? summary.querySelector('[data-cp-running-label], [data-cp-summary-label]') ?? summary
+        : summary.querySelector('[data-cp-part="row-label"]')
         ?? summary.querySelector("button > div > div:nth-child(2)")
         ?? button;
     if (reduced.matches || !line?.animate) return;
-    const clipOwner = recap || line === button ? summary : button;
+    const clipOwner = recap || completedRun || pluginSummary || line === button ? summary : button;
     const originalOverflow = clipOwner?.style.getPropertyValue("overflow") ?? "";
     if (clipOwner) clipOwner.style.setProperty("overflow", "clip");
-    // Match the plugin row's state transition: its words arrive with a small
-    // lift after the viewport has begun making room. The icon and details stay
-    // outside this animation, preserving disclosure and status motion.
+    // Let the timeline begin moving first, then reveal the words into the
+    // space it made. The icon and details stay outside this animation,
+    // preserving disclosure and status motion.
     const animation = line.animate([
-      { opacity: 0.25, transform: "translateY(4px)" },
+      { opacity: 0, transform: "translateY(4px)" },
+      { offset: 0.25, opacity: 0, transform: "translateY(0)" },
       { opacity: 1, transform: "translateY(0)" },
     ], { duration: 240, delay: TOOL_SUMMARY_ENTRY_DELAY_MS, easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "both" });
     const restoreOverflow = () => {
@@ -569,15 +665,36 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
     const rows = Array.from(chat.querySelectorAll(HISTORY_ROW));
     const running = Boolean(chat.querySelector(WORKING));
     const maxScrollTop = Math.max(0, chat.scrollHeight - chat.clientHeight);
-    const atBottom = maxScrollTop - chat.scrollTop < 180;
+    const userScrolling = Date.now() < (userScrollUntil.get(chat) ?? 0);
+    const wasFollowing = Boolean(old && old.maxScrollTop - old.scrollTop < 180 && !userScrolling);
+    const atBottom = maxScrollTop - chat.scrollTop < 180
+      || Boolean(old && wasFollowing && maxScrollTop > old.maxScrollTop && chat.scrollTop >= old.scrollTop - 1);
+    // The fork-menu footer belongs to whichever turn is currently last, not
+    // to a specific history row, so its identity for "already seen" purposes
+    // is the last row's stable ID rather than the footer element itself.
+    const footerDetailsPresent = Boolean(chat.querySelector(TURN_FOOTER_DETAILS));
+    const lastRowId = rows[rows.length - 1]?.getAttribute("data-history-row-id") ?? null;
+    const footerIsNew = Boolean(footerDetailsPresent && lastRowId && !seenFooterTurnIds.has(lastRowId));
+    if (footerDetailsPresent && lastRowId) seenFooterTurnIds.add(lastRowId);
     const seen = old?.seen ?? new Set<string>();
+    const seenToolSummaryRows = old?.seenToolSummaryRows ?? new Set<string>();
     const seenRecapRows = old?.seenRecapRows ?? new Set<string>();
     const seenRunSummaryRows = old?.seenRunSummaryRows ?? new Set<string>();
     const pending = animate && !hydrationBoundary ? old?.pending ?? new Set<string>() : new Set<string>();
     const pendingTools = animate && !hydrationBoundary ? old?.pendingTools ?? new Set<string>() : new Set<string>();
     const pendingRunSummaries = animate && !hydrationBoundary ? old?.pendingRunSummaries ?? new Set<string>() : new Set<string>();
+    const arrivalRows = animate && !hydrationBoundary ? old?.arrivalRows ?? new Map<string, number>() : new Map<string, number>();
     const firstHistoryPopulation = Boolean(old && old.seen.size === 0 && rows.length > 0);
-    const hydrationQuietUntil = hydrationBoundary || firstHistoryPopulation ? Date.now() + 500 : old?.hydrationQuietUntil ?? 0;
+    // Rehydration after a tab switch can keep reflowing (syntax highlighting,
+    // images, staggered renders) well past a single fixed delay. Renew the
+    // quiet window on every update that lands while still inside it, so it
+    // only lapses once the chat has actually gone quiet rather than on a
+    // fixed deadline from the first observed change.
+    const liveStreaming = running || Boolean(chat.querySelector(STREAMING_REPLY));
+    const wasSuppressingHydration = !liveStreaming && Date.now() < (old?.hydrationQuietUntil ?? 0);
+    const hydrationQuietUntil = hydrationBoundary || firstHistoryPopulation || wasSuppressingHydration
+      ? Date.now() + 500
+      : old?.hydrationQuietUntil ?? 0;
     const suppressHydrationMotion = Date.now() < hydrationQuietUntil;
     const widthChanged = Boolean(old && Math.abs(chat.clientWidth - old.clientWidth) > 0.5);
     // Sidebar motion can trigger several trailing wraps. They are viewport
@@ -585,19 +702,24 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
     // short quiet boundary alive through the host's follow-up scroll event.
     const reflowQuietUntil = widthChanged ? Date.now() + 120 : old?.reflowQuietUntil ?? 0;
     const suppressWidthReflowMotion = Date.now() < reflowQuietUntil;
+    const footerDetailsEntered = Boolean(old && animate && atBottom && footerIsNew && !hydrationBoundary && !firstHistoryPopulation);
     let entered = 0;
+    let userMessageEntered = false;
     let toolEntered = 0;
+    const stationaryTargets = new Set<DomElement>();
     for (const row of rows) {
       const id = row.getAttribute("data-history-row-id");
       if (!id) continue;
       const isNew = !seen.has(id);
       const isUserMessage = Boolean(row.querySelector('[data-testid="user-message"]'));
-      const toolSummary = row.querySelector(ROW);
+      const toolSummary = row.querySelector(`${ROW}, ${PLUGIN_TOOL_SUMMARY}`);
       const recapSummary = row.querySelector(TURN_RECAP);
       const runSummary = row.querySelector(RUN_SUMMARY);
       const summary = toolSummary ?? recapSummary;
+      const toolSummaryIsNew = Boolean(toolSummary && !seenToolSummaryRows.has(id));
       const recapIsNew = Boolean(recapSummary && !seenRecapRows.has(id));
       const runSummaryIsNew = Boolean(runSummary && !seenRunSummaryRows.has(id));
+      if (toolSummary) seenToolSummaryRows.add(id);
       if (recapSummary) seenRecapRows.add(id);
       if (runSummary) seenRunSummaryRows.add(id);
       const isHydrating = hydrationBoundary || firstHistoryPopulation;
@@ -629,7 +751,7 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
           isUserMessage: false,
           suppressHydrationMotion,
           isHydrating,
-          isNew,
+          isNew: toolSummaryIsNew,
           allow: animate,
           atBottom,
         });
@@ -638,37 +760,73 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
       const box = row.getBoundingClientRect();
       if (pending.has(id) && box.width > 0 && box.height > 0) {
         pending.delete(id);
-        if (animate && atBottom && (!suppressHydrationMotion || canEnterDuringHydration) && entered++ < 12) animateEntry(row);
+        if (animate && atBottom && (!suppressHydrationMotion || canEnterDuringHydration) && entered++ < 12) {
+          userMessageEntered = true;
+          animateEntry(row);
+        }
       }
       if (pendingTools.has(id) && box.width > 0 && box.height > 0) {
         pendingTools.delete(id);
-        if (animate && atBottom && !suppressHydrationMotion && !suppressWidthReflowMotion && toolEntered++ < 12 && summary) animateSummary(summary);
+        if (animate && atBottom && !suppressHydrationMotion && !suppressWidthReflowMotion && toolEntered++ < 12 && summary) {
+          animateSummary(summary);
+          if (!summary.matches(TURN_RECAP)) {
+            stationaryTargets.add(summary);
+            arrivalRows.set(id, Date.now() + 220);
+          }
+        }
       }
       const runSummaryBox = runSummary?.getBoundingClientRect();
-      if (pendingRunSummaries.has(id) && runSummaryBox && runSummaryBox.width > 0 && runSummaryBox.height > 0) {
+      if (pendingRunSummaries.has(id) && runSummary && runSummaryBox && runSummaryBox.width > 0 && runSummaryBox.height > 0) {
         pendingRunSummaries.delete(id);
-        // MergedSteps already owns the label's fade/rise. Count its completed
-        // state as a logical arrival only for viewport lead, avoiding a second
-        // animation on the same DOM subtree.
-        if (animate && atBottom && !suppressHydrationMotion && !suppressWidthReflowMotion && toolEntered < 12) toolEntered++;
+        if (animate && atBottom && !suppressHydrationMotion && !suppressWidthReflowMotion && toolEntered < 12) {
+          toolEntered++;
+          animateSummary(runSummary);
+          stationaryTargets.add(runSummary);
+          arrivalRows.set(id, Date.now() + 220);
+        }
       }
     }
     const currentIds = new Set(rows.map((row) => row.getAttribute("data-history-row-id")).filter((id): id is string => Boolean(id)));
     for (const id of pending) if (!atBottom || !currentIds.has(id)) pending.delete(id);
     for (const id of pendingTools) if (!atBottom || !currentIds.has(id)) pendingTools.delete(id);
     for (const id of pendingRunSummaries) if (!atBottom || !currentIds.has(id)) pendingRunSummaries.delete(id);
+    for (const [id, until] of arrivalRows) if (Date.now() >= until || !currentIds.has(id)) arrivalRows.delete(id);
+    const bottomRow = rows[rows.length - 1];
+    for (const row of rows) {
+      const id = row.getAttribute("data-history-row-id");
+      if (!id || !arrivalRows.has(id)) continue;
+      const activeRunSummary = row.querySelector(RUN_SUMMARY);
+      if (activeRunSummary) stationaryTargets.add(activeRunSummary);
+      else if (row === bottomRow) stationaryTargets.add(row);
+    }
     while (seen.size > 5000) seen.delete(seen.values().next().value!);
+    while (seenToolSummaryRows.size > 5000) seenToolSummaryRows.delete(seenToolSummaryRows.values().next().value!);
+    while (seenFooterTurnIds.size > 5000) seenFooterTurnIds.delete(seenFooterTurnIds.values().next().value!);
 
     let compensatedScrollTop = chat.scrollTop;
     // Measure the whole content surface so footer height participates in the
     // viewport delta. contentRise translates only the timeline, leaving the
     // Working/Worked footer at its laid-out bottom position.
-    const riseSurface = chat.querySelector(CHAT_CONTENT) ?? chat.querySelector(CHAT_TIMELINE) ?? rows[0]?.parentElement ?? null;
+    const riseSurface = chatContentOf(chat) ?? chat.querySelector(CHAT_TIMELINE) ?? rows[0]?.parentElement ?? null;
     const suppressDisclosureRise = Date.now() < (chatDisclosureQuietUntil.get(chat) ?? 0);
+    const activeEntryRise = Date.now() < (old?.entryRiseUntil ?? 0) && !hydrationBoundary && !firstHistoryPopulation;
+    const entryRiseUntil = userMessageEntered || footerDetailsEntered || activeEntryRise
+      ? hydrationQuietUntil
+      : old?.entryRiseUntil ?? 0;
+    const suppressHydrationRise = suppressHydrationMotion && Date.now() >= entryRiseUntil;
+    // Cached history can fill in without replacing its keyed row, long after
+    // the initial hydration window. Only live-turn changes should move the
+    // whole timeline; passive edits to already-seen history rebase in place.
+    const logicalArrival = userMessageEntered || footerDetailsEntered || toolEntered > 0;
+    const liveLayoutUntil = logicalArrival || liveStreaming ? Date.now() + 180 : old?.liveLayoutUntil ?? 0;
+    const liveLayoutChange = liveStreaming || Boolean(old?.running) || Date.now() < liveLayoutUntil;
+    const passiveLayoutShift = !liveLayoutChange && Boolean(old && Math.abs(maxScrollTop - old.maxScrollTop) > 0.5);
     let toolLeadUntil = toolEntered > 0 ? Date.now() + 120 : old?.toolLeadUntil ?? 0;
-    if (old && animate && riseSurface && atBottom && !reduced.matches && !suppressHydrationMotion && !suppressWidthReflowMotion && !suppressDisclosureRise) {
-      const wasFollowing = old.maxScrollTop - old.scrollTop < 180;
-      const anticipatesHostFollow = wasFollowing && maxScrollTop > old.maxScrollTop && chat.scrollTop <= old.compensatedScrollTop + 0.5;
+    if (old && animate && riseSurface && atBottom && liveLayoutChange && !reduced.matches && !suppressHydrationRise && !suppressWidthReflowMotion && !suppressDisclosureRise) {
+      const priorScrollBaseline = wasFollowing && chat.scrollTop > old.compensatedScrollTop
+        ? Math.min(chat.scrollTop, old.maxScrollTop)
+        : old.compensatedScrollTop;
+      const anticipatesHostFollow = wasFollowing && maxScrollTop > old.maxScrollTop && chat.scrollTop <= priorScrollBaseline + 0.5;
       if (anticipatesHostFollow) compensatedScrollTop = maxScrollTop;
       else if (wasFollowing && maxScrollTop >= old.maxScrollTop && old.compensatedScrollTop > chat.scrollTop + 0.5) {
         // ResizeObserver can run again before Paseo's next-frame bottom follow.
@@ -676,7 +834,7 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
         // retarget the inverse rise by the same distance and cancel it.
         compensatedScrollTop = old.compensatedScrollTop;
       }
-      const layoutDistance = compensatedScrollTop - old.compensatedScrollTop;
+      const layoutDistance = compensatedScrollTop - priorScrollBaseline;
       const applyToolLead = Date.now() < toolLeadUntil && layoutDistance > 0.5;
       const distance = layoutDistance + (applyToolLead ? TOOL_SUMMARY_SCROLL_LEAD_PX : 0);
       if (applyToolLead) toolLeadUntil = 0;
@@ -687,22 +845,27 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
         cancelChatRise.set(chat, () => rise?.cancel());
         rises.add(rise);
       }
-      if (anticipatesHostFollow) rise.prepare(distance);
-      else rise.start(distance);
-    } else if (suppressHydrationMotion || suppressWidthReflowMotion || suppressDisclosureRise) chatRises.get(chat)?.cancel();
+      const stationary = Array.from(stationaryTargets);
+      if (anticipatesHostFollow) rise.prepare(distance, stationary);
+      else rise.start(distance, stationary);
+    } else if (passiveLayoutShift || suppressHydrationRise || suppressWidthReflowMotion || suppressDisclosureRise) chatRises.get(chat)?.cancel();
     chatStates.set(chat, {
       seen,
+      seenToolSummaryRows,
       seenRecapRows,
       seenRunSummaryRows,
       pending,
       pendingTools,
       pendingRunSummaries,
+      arrivalRows,
       running,
       scrollTop: chat.scrollTop,
       compensatedScrollTop,
       maxScrollTop,
       clientWidth: chat.clientWidth,
       toolLeadUntil,
+      entryRiseUntil,
+      liveLayoutUntil,
       hydrationQuietUntil,
       reflowQuietUntil,
     });
@@ -742,7 +905,7 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
       observedChats.add(chat);
       resizeObserver?.observe(chat);
     }
-    const content = chat.querySelector(CHAT_CONTENT) ?? chat.firstElementChild;
+    const content = chatContentOf(chat);
     if (content && !observedContent.has(content)) {
       observedContent.add(content);
       // The scroller's border box does not change when a mounted tool gains
@@ -760,14 +923,49 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
     if (!target?.matches?.(CHAT)) return;
     const old = chatStates.get(target);
     if (!old) return updateChat(target, false);
-    if (Date.now() < (userScrollUntil.get(target) ?? 0)) chatRises.get(target)?.cancel();
+    const userScrolling = Date.now() < (userScrollUntil.get(target) ?? 0);
+    if (userScrolling) chatRises.get(target)?.cancel();
+    const maxScrollTop = Math.max(0, target.scrollHeight - target.clientHeight);
+    const wasFollowing = old.maxScrollTop - old.scrollTop < 180;
+    const rowsNow = Array.from(target.querySelectorAll(HISTORY_ROW));
+    const hasNewUserMessage = rowsNow.some((row) => {
+      const id = row.getAttribute("data-history-row-id");
+      return Boolean(id && !old.seen.has(id) && row.querySelector('[data-testid="user-message"]'));
+    });
+    const hasNewToolSummary = rowsNow.some((row) => {
+      const id = row.getAttribute("data-history-row-id");
+      return Boolean(id && !old.seenToolSummaryRows.has(id) && row.querySelector(`${ROW}, ${PLUGIN_TOOL_SUMMARY}`));
+    });
+    const hasNewRecap = rowsNow.some((row) => {
+      const id = row.getAttribute("data-history-row-id");
+      return Boolean(id && !old.seenRecapRows.has(id) && row.querySelector(TURN_RECAP));
+    });
+    const hasNewRunSummary = rowsNow.some((row) => {
+      const id = row.getAttribute("data-history-row-id");
+      return Boolean(id && !old.seenRunSummaryRows.has(id) && row.querySelector(RUN_SUMMARY));
+    });
+    const lastRowIdNow = rowsNow[rowsNow.length - 1]?.getAttribute("data-history-row-id") ?? null;
+    const hasNewFooterDetails = Boolean(lastRowIdNow && !seenFooterTurnIds.has(lastRowIdNow) && target.querySelector(TURN_FOOTER_DETAILS));
+    // Paseo may commit its programmatic bottom follow before MutationObserver
+    // or ResizeObserver reports the row that caused it. Keep the pre-growth
+    // geometry for that observer pass; otherwise this scroll would erase the
+    // height delta and the new tool summary would pop into place. Real user
+    // input still rebases immediately and cancels active motion above.
+    const liveTurn = old.running || Date.now() < old.liveLayoutUntil
+      || Boolean(target.querySelector(WORKING) || target.querySelector(STREAMING_REPLY));
+    const earlyHostFollow = !userScrolling
+      && wasFollowing
+      && (liveTurn || hasNewUserMessage || hasNewToolSummary || hasNewRecap || hasNewRunSummary || hasNewFooterDetails)
+      && maxScrollTop > old.maxScrollTop + 0.5
+      && target.scrollTop > old.scrollTop + 0.5;
+    if (earlyHostFollow) return;
     // A scroll commits a viewport position; it is never new streamed output.
     // Rebase the next mutation without replaying this delta as timeline motion.
     chatStates.set(target, {
       ...old,
       scrollTop: target.scrollTop,
       compensatedScrollTop: target.scrollTop,
-      maxScrollTop: Math.max(0, target.scrollHeight - target.clientHeight),
+      maxScrollTop,
       clientWidth: target.clientWidth,
     });
   };
@@ -795,7 +993,7 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
   const unwatch = watchDom({
     mutated: (records) => {
       const animate = syncEnabled();
-      const hydrating = historyRemovalChats(records);
+      const hydrating = historyRemountChats(records);
       for (const chat of chatsFrom(records)) {
         observeChat(chat);
         updateChat(chat, animate, hydrating.has(chat));
@@ -954,7 +1152,7 @@ const CLAMP_CSS = `
 [${CLAMP}] { cursor: pointer; }
 [${CLAMP}] > :last-child { overflow: hidden; }
 [${CLAMP}="closed"] > :last-child { max-height: var(--chat-polish-max); -webkit-mask-image: linear-gradient(#000 55%, transparent); mask-image: linear-gradient(#000 55%, transparent); }
-[${CLAMP}]::after { content: "Show full message"; margin-top: 8px; font-size: 12px; font-weight: 500; color: var(--chat-polish-muted); opacity: 0.75; }
+[${CLAMP}]::after { content: "Show full message"; margin-top: 8px; font-size: 12px; font-weight: 500; color: var(--cp-muted, var(--colors-foreground-muted)); opacity: 0.75; }
 [${CLAMP}="open"]::after { content: "Show less"; }
 `;
 
@@ -1007,7 +1205,6 @@ export function clampUserMessages(enabled: () => boolean) {
         if (!line || text.scrollHeight < line * CLAMP_FROM_LINES) continue;
         const collapsedHeight = Math.round(line * SHOWN_LINES);
         bubble.style.setProperty("--chat-polish-max", `${collapsedHeight}px`);
-        bubble.style.setProperty("--chat-polish-muted", css.color);
         bubble.setAttribute(CLAMP, "closed");
         // Selecting text inside the bubble shouldn't toggle it.
         const onClick = () => {
@@ -1094,7 +1291,7 @@ const THUMBS = `:root:not([data-cp-rt-images="native"]) ${MSG} [data-paseo-markd
 // Paseo marks each markdown part for its copy-as-markdown feature; the restyle keys on those marks.
 const md = (tag: string) => `[data-paseo-markdown-tag="${tag}"]`;
 const INLINE_CODE = `span${md("code")}`;
-const HEADING = (n: number) => `${md(`h${n}`)} > [dir] > span`;
+const HEADING = (n: number) => `${md(`h${n}`)} :is([dir], span)`;
 const MARK = "[data-paseo-markdown-list-marker]";
 const MARK_UL = `${md("ul")} > ${md("li")} > ${MARK}`;
 const MARK_OL = `${md("ol")} > ${md("li")} > ${MARK}`;
@@ -1124,6 +1321,8 @@ const LIMIT = '[data-cp-part="usage-limits"] > div';
 const QUESTION = '[data-testid="question-form-card"]';
 const PRIMARY = ':is([data-testid="permission-request-accept"], [data-testid="question-form-primary-action"])';
 const SECONDARY = ':is([data-testid="permission-request-deny"], [data-testid="question-form-dismiss"])';
+// Other permission actions, such as "Implement with Auto" on plans (Paseo 0.13) or OpenCode's "Allow once"; either variant.
+const ACTION = '[data-testid^="permission-request-action-"]';
 
 // Paseo steps the working dots' opacity from JS every ~160ms, which reads as slow and choppy. The same
 // clockwise chase (dots 4, 6, 5, 3, 1, 2) as a CSS animation runs smoothly on the compositor.
@@ -1455,12 +1654,12 @@ ${ROW} > button { background-color: transparent !important; border-color: transp
 [data-cp-part="att-icon"] { width: 32px !important; height: 32px !important; border-radius: 8px; background-color: var(--cp-control); }
 [data-cp-part="att-files"] > * > div > :last-child > :first-child { font-size: 13px !important; font-weight: 500 !important; color: var(--cp-fg) !important; }
 [data-cp-part="att-files"] > * > div > :last-child > :last-child { font-size: 12px !important; color: var(--cp-muted) !important; }
-/* Density (Prefs.density) and faded row strength (Prefs.steps) as variables the rules below read; views.tsx matches them (TIGHT, QUIET). */
-:root { --cp-d-item: ${CHAT_MARKDOWN_DENSITY.normal.itemGap}px; --cp-d-pad: ${CHAT_MARKDOWN_DENSITY.normal.padding}px; --cp-d-row-top: 2px; --cp-d-row-bottom: -8px; --cp-d-footer: 16px; --cp-d-prompt: 8px; --cp-d-li: 6px; --cp-quiet: 0.45; }
-:root[data-cp-rt-density="compact"] { --cp-d-item: ${CHAT_MARKDOWN_DENSITY.compact.itemGap}px; --cp-d-pad: ${CHAT_MARKDOWN_DENSITY.compact.padding}px; --cp-d-row-top: 0px; --cp-d-row-bottom: -12px; --cp-d-footer: 12px; --cp-d-prompt: 0px; --cp-d-li: 3px; }
-:root[data-cp-rt-density="spacious"] { --cp-d-item: ${CHAT_MARKDOWN_DENSITY.spacious.itemGap}px; --cp-d-pad: ${CHAT_MARKDOWN_DENSITY.spacious.padding}px; --cp-d-row-top: 5px; --cp-d-row-bottom: -3px; --cp-d-footer: 22px; --cp-d-prompt: 18px; --cp-d-li: 10px; }
-:root[data-cp-rt-steps="dim"] { --cp-quiet: 0.3; }
-:root[data-cp-rt-steps="soft"] { --cp-quiet: 0.65; }
+/* Density (Prefs.density) and faded row strength (Prefs.steps) as variables the rules below read; CHAT_ROW_TIGHT / CHAT_ROW_QUIET. */
+:root { --cp-d-item: ${CHAT_MARKDOWN_DENSITY.normal.itemGap}px; --cp-d-pad: ${CHAT_MARKDOWN_DENSITY.normal.padding}px; --cp-d-row-top: ${CHAT_ROW_TIGHT.normal.marginTop}px; --cp-d-row-bottom: ${CHAT_ROW_TIGHT.normal.marginBottom}px; --cp-d-footer: 16px; --cp-d-prompt: 8px; --cp-d-li: ${CHAT_MARKDOWN_DENSITY.normal.listGap}px; --cp-quiet: ${CHAT_ROW_QUIET.faded}; }
+:root[data-cp-rt-density="compact"] { --cp-d-item: ${CHAT_MARKDOWN_DENSITY.compact.itemGap}px; --cp-d-pad: ${CHAT_MARKDOWN_DENSITY.compact.padding}px; --cp-d-row-top: ${CHAT_ROW_TIGHT.compact.marginTop}px; --cp-d-row-bottom: ${CHAT_ROW_TIGHT.compact.marginBottom}px; --cp-d-footer: 12px; --cp-d-prompt: 0px; --cp-d-li: ${CHAT_MARKDOWN_DENSITY.compact.listGap}px; }
+:root[data-cp-rt-density="spacious"] { --cp-d-item: ${CHAT_MARKDOWN_DENSITY.spacious.itemGap}px; --cp-d-pad: ${CHAT_MARKDOWN_DENSITY.spacious.padding}px; --cp-d-row-top: ${CHAT_ROW_TIGHT.spacious.marginTop}px; --cp-d-row-bottom: ${CHAT_ROW_TIGHT.spacious.marginBottom}px; --cp-d-footer: 22px; --cp-d-prompt: 18px; --cp-d-li: ${CHAT_MARKDOWN_DENSITY.spacious.listGap}px; }
+:root[data-cp-rt-steps="dim"] { --cp-quiet: ${CHAT_ROW_QUIET.dim}; }
+:root[data-cp-rt-steps="soft"] { --cp-quiet: ${CHAT_ROW_QUIET.soft}; }
 /* Chat rhythm (15px text): 18 between paragraphs, 20 between text and step rows, ~21 to the turn footer, 28 from a prompt to its
    reply, 46 between turns. Paseo stacks three spacings per reply block (its item's 12/16 margin, 12 padding at a reply's ends,
    12 under each paragraph), which left 28 between paragraphs and pushed rows and prompts apart. */
@@ -1478,36 +1677,36 @@ ${ROW} > button { background-color: transparent !important; border-color: transp
 [data-testid="user-message"] > div > div:first-child > :last-child { line-height: 1.55 !important; }
 
 ${MSG} span { line-height: ${CHAT_MARKDOWN_LINE_HEIGHT} !important; }
-${MSG} ${INLINE_CODE} { border-radius: 4px !important; padding: 2px 5px !important; }
+${MSG} ${INLINE_CODE} { border-radius: ${CHAT_MARKDOWN_VISUAL.inlineRadius}px !important; padding: ${CHAT_MARKDOWN_VISUAL.inlinePadding.vertical}px ${CHAT_MARKDOWN_VISUAL.inlinePadding.horizontal}px !important; }
 ${MSG} ${md("strong")}, ${MSG} ${md("strong")} span { font-weight: 600 !important; }
-${MSG} ${HEADING(1)} { font-size: 24px !important; line-height: 1.3 !important; }
-${MSG} ${HEADING(2)} { font-size: 20px !important; line-height: 1.3 !important; }
-${MSG} ${HEADING(3)} { font-size: 16px !important; line-height: 1.3 !important; }
+${MSG} ${HEADING(1)} { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.standard[0]}px !important; line-height: ${CHAT_MARKDOWN_VISUAL.headingLineHeight} !important; font-weight: 600 !important; }
+${MSG} ${HEADING(2)} { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.standard[1]}px !important; line-height: ${CHAT_MARKDOWN_VISUAL.headingLineHeight} !important; font-weight: 600 !important; }
+${MSG} ${HEADING(3)} { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.standard[2]}px !important; line-height: ${CHAT_MARKDOWN_VISUAL.headingLineHeight} !important; font-weight: 600 !important; }
 ${MSG} ${md("h1")}, ${MSG} ${md("h2")} { border-bottom-width: 0 !important; padding-bottom: 0 !important; }
 ${MSG} ${md("li")}:not(:last-child) { margin-bottom: var(--cp-d-li) !important; }
 ${MSG} ${md("li")}:last-child { margin-bottom: 0 !important; }
-${MSG} ${MARK} { margin: 0 10px 0 4px !important; line-height: calc(var(--cp-content) * ${CHAT_MARKDOWN_LINE_HEIGHT}) !important; }
+${MSG} ${MARK} { margin: 0 ${CHAT_MARKDOWN_VISUAL.listMarkerMargin.right}px 0 ${CHAT_MARKDOWN_VISUAL.listMarkerMargin.left}px !important; line-height: calc(var(--cp-content) * ${CHAT_MARKDOWN_LINE_HEIGHT}) !important; }
 ${MSG} ${MARK_OL} { font-family: var(--cp-mono) !important; font-size: calc(var(--cp-code) + 1px) !important; }
-${MSG} ${md("blockquote")} { background: transparent !important; border-left: 2px solid var(--cp-accent) !important; border-radius: 0 !important; padding: 2px 0 2px 14px !important; margin: 4px 0 !important; }
+${MSG} ${md("blockquote")} { background: transparent !important; border-left: ${CHAT_MARKDOWN_VISUAL.quote.border}px solid var(--cp-accent) !important; border-radius: 0 !important; padding: 2px 0 2px ${CHAT_MARKDOWN_VISUAL.quote.indent}px !important; margin: 4px 0 !important; }
 ${MSG} ${md("blockquote")} > :last-child { margin-bottom: 0 !important; }
 ${MSG} ${md("blockquote")} span { font-style: italic !important; color: var(--cp-muted) !important; }
-${MSG} ${md("table")} { border-radius: 8px !important; border-color: var(--cp-rule) !important; overflow: hidden !important; }
+${MSG} ${md("table")} { border-radius: ${CHAT_MARKDOWN_VISUAL.blockRadius}px !important; border-color: var(--cp-rule) !important; overflow: hidden !important; }
 ${MSG} ${md("table")} > div > div { border-color: var(--cp-rule) !important; }
 ${MSG} ${md("table")} > div:last-child > div:last-child { border-bottom-width: 0 !important; }
-${MSG} ${md("table")} > div > div > div { padding: 9px 14px !important; border-right-width: 0 !important; border-bottom-width: 0 !important; background: transparent !important; }
+${MSG} ${md("table")} > div > div > div { padding: ${CHAT_MARKDOWN_VISUAL.table.vertical}px ${CHAT_MARKDOWN_VISUAL.table.horizontal}px !important; border-right-width: 0 !important; border-bottom-width: 0 !important; background: transparent !important; }
 ${MSG} ${md("table")} > div:first-child { background: var(--cp-raised) !important; }
 ${MSG} ${md("table")} span:not(${INLINE_CODE}) { font-size: calc(var(--cp-content) - 1px) !important; }
 ${MSG} ${md("table")} span { line-height: 1.45 !important; }
 ${MSG} ${md("table")} > div:first-child span:not(${INLINE_CODE}) { font-size: 12px !important; font-weight: 600 !important; color: var(--cp-muted) !important; }
-${CODE_BLOCK} { background: var(--cp-sunken) !important; border-color: var(--cp-rule) !important; border-radius: 8px !important; padding: 12px 14px !important; }
-${CODE_BLOCK} :is(div, span) { line-height: 1.5 !important; }
+${CODE_BLOCK} { background: var(--cp-sunken) !important; border-color: var(--cp-rule) !important; border-radius: ${CHAT_MARKDOWN_VISUAL.blockRadius}px !important; padding: ${CHAT_MARKDOWN_VISUAL.codePaddingVertical}px ${CHAT_MARKDOWN_VISUAL.table.horizontal}px !important; }
+${CODE_BLOCK} :is(div, span) { line-height: ${CHAT_MARKDOWN_CODE_LINE_HEIGHT} !important; }
 /* Code block A: the language in a header strip, with Paseo's copy button in it. B floats the language instead; C has none. */
 :root:not([data-cp-rt-code="b"]):not([data-cp-rt-code="c"]) ${CODE_BLOCK}${LANG} { padding-top: 0 !important; }
 :root:not([data-cp-rt-code="b"]):not([data-cp-rt-code="c"]) ${CODE_BLOCK}${LANG}::before { content: attr(data-paseo-markdown-language); margin: 0 -14px 10px; padding: 7px 14px; border-bottom: 1px solid var(--cp-rule); font-family: var(--cp-mono); font-size: 12px; line-height: 18px; color: var(--cp-muted); }
 :root:not([data-cp-rt-code="b"]):not([data-cp-rt-code="c"]) ${CODE_BLOCK}${LANG} > button[aria-label="Copy code"] { top: 5px !important; opacity: 0.6 !important; }
 :root:not([data-cp-rt-code="b"]):not([data-cp-rt-code="c"]) ${CODE_BLOCK}${LANG} > button[aria-label="Copy code"]:hover { opacity: 1 !important; }
 /* Mermaid: the diagram itself is themed inside its frame (themeMermaid); the card matches code blocks, its zoom controls faint until hover. */
-[data-testid="mermaid-viewport"] { background-color: var(--cp-sunken) !important; border-color: var(--cp-rule) !important; border-radius: 8px !important; }
+[data-testid="mermaid-viewport"] { background-color: var(--cp-sunken) !important; border-color: var(--cp-rule) !important; border-radius: ${CHAT_MARKDOWN_VISUAL.blockRadius}px !important; }
 [data-testid="mermaid-viewport"] [data-testid="zoomable-viewport-toolbar"] { opacity: 0.6; transition: opacity 0.15s; }
 [data-testid="mermaid-viewport"]:hover [data-testid="zoomable-viewport-toolbar"] { opacity: 1; }
 /* Over a diagram's source, Paseo puts its "View diagram" button where the code block's copy button is; it sits beside it instead. */
@@ -1521,48 +1720,45 @@ ${CODE_BLOCK} :is(div, span) { line-height: 1.5 !important; }
 [data-cp-redraw="failed"] { background-color: var(--cp-warn); opacity: 1; }
 [data-cp-part="diagram-toggle"] ~ [data-cp-redraw], [data-cp-redrawn] > :is([data-paseo-markdown-language], [data-cp-redraw], [data-cp-part="diagram-toggle"]) { display: none !important; }
 [data-cp-redraw] ~ [data-cp-part="diagram-toggle"] { right: 58px !important; }
-[data-cp-redraw-card] { display: flex; justify-content: center; padding: 12px; cursor: zoom-in; border: 1px solid var(--cp-rule); border-radius: 8px; background-color: var(--cp-sunken); }
+[data-cp-redraw-card] { display: flex; justify-content: center; padding: 12px; cursor: zoom-in; border: 1px solid var(--cp-rule); border-radius: ${CHAT_MARKDOWN_VISUAL.blockRadius}px; background-color: var(--cp-sunken); }
 [data-cp-redraw-card] > iframe { display: block; width: 100%; height: 120px; border: 0; background: transparent; pointer-events: none; }
 [data-cp-diagram-full] { position: fixed; inset: 0; z-index: 2147483000; padding: 32px; background-color: var(--cp-sunken); cursor: zoom-out; }
 [data-cp-diagram-full] > iframe { display: block; width: 100%; height: 100%; border: 0; background: transparent; pointer-events: none; }
 /* Images in a reply that also has text (tool screenshots land at the end of the text before them) get the plugin's thumbnail size; Paseo's own button still opens the full image. */
 ${THUMBS} { width: auto !important; min-height: 0 !important; margin: 6px 8px 2px 0 !important; }
 :root:not([data-cp-rt-images="native"]) ${MSG} [data-cp-part="image-text"] > [dir] { flex-basis: 100% !important; }
-${THUMBS} > button { width: var(--cp-thumb-w) !important; height: var(--cp-thumb-h) !important; aspect-ratio: auto !important; border: 1px solid var(--cp-rule) !important; border-radius: 8px !important; background-color: var(--cp-raised) !important; }
+${THUMBS} > button { width: var(--cp-thumb-w) !important; height: var(--cp-thumb-h) !important; aspect-ratio: auto !important; border: 1px solid var(--cp-rule) !important; border-radius: ${CHAT_MARKDOWN_VISUAL.blockRadius}px !important; background-color: var(--cp-raised) !important; }
 ${THUMBS} > button div { width: 100% !important; height: 100% !important; background-size: cover !important; }
-:root { --cp-thumb-w: 200px; --cp-thumb-h: 128px; }
-:root[data-cp-rt-images="large"] { --cp-thumb-w: 320px; --cp-thumb-h: 200px; }
+:root { --cp-thumb-w: ${CHAT_IMAGE_FRAMES.small.width}px; --cp-thumb-h: ${CHAT_IMAGE_FRAMES.small.height}px; }
+:root[data-cp-rt-images="large"] { --cp-thumb-w: ${CHAT_IMAGE_FRAMES.large.width}px; --cp-thumb-h: ${CHAT_IMAGE_FRAMES.large.height}px; }
 
 /* The same design on Paseo 0.12's renderer. A whole reply is one block now, so the gap between paragraphs is its children's
    margin: the 0.11 spacing (item margin plus padding on both ends), with the 1.6 line height's leading on top. */
-${MD} > * { margin-bottom: calc(var(--cp-d-item) + 2 * var(--cp-d-pad)) !important; }
-${MD} > :last-child, ${MD} :is(blockquote, .enrm-admonition, li) > p:last-child { margin-bottom: 0 !important; }
+${MD} > *, ${MD} ${md("body")} > * { margin-top: 0 !important; margin-bottom: calc(var(--cp-d-item) + 2 * var(--cp-d-pad)) !important; }
+${MD} > :last-child, ${MD} ${md("body")} > :last-child, ${MD} :is(blockquote, .enrm-admonition, li) > p:last-child { margin-bottom: 0 !important; }
+${MD} ${md("body")} { row-gap: 0 !important; }
 ${MD} :is(p, li, blockquote) { line-height: ${CHAT_MARKDOWN_LINE_HEIGHT} !important; }
-${MD} code { border-radius: 4px !important; padding: 2px 5px !important; }
+${MD} code { border-radius: ${CHAT_MARKDOWN_VISUAL.inlineRadius}px !important; padding: ${CHAT_MARKDOWN_VISUAL.inlinePadding.vertical}px ${CHAT_MARKDOWN_VISUAL.inlinePadding.horizontal}px !important; }
 ${MD} strong { font-weight: 600 !important; }
-${MD} h1 { font-size: 24px !important; line-height: 1.3 !important; }
-${MD} h2 { font-size: 20px !important; line-height: 1.3 !important; }
-${MD} h3 { font-size: 16px !important; line-height: 1.3 !important; }
+${MD} h1 { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.standard[0]}px !important; line-height: ${CHAT_MARKDOWN_VISUAL.headingLineHeight} !important; }
+${MD} h2 { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.standard[1]}px !important; line-height: ${CHAT_MARKDOWN_VISUAL.headingLineHeight} !important; }
+${MD} h3 { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.standard[2]}px !important; line-height: ${CHAT_MARKDOWN_VISUAL.headingLineHeight} !important; }
 ${MD} li { margin-top: 0 !important; }
 ${MD} li:not(:last-child) { margin-bottom: var(--cp-d-li) !important; }
 ${MD} ol > li::marker { font-family: var(--cp-mono); font-size: calc(var(--cp-code) + 1px); }
-${MD} blockquote { background: transparent !important; border-inline-start: 2px solid var(--cp-accent) !important; border-radius: 0 !important; padding: 2px 0 2px 14px !important; }
+${MD} blockquote { background: transparent !important; border-inline-start: ${CHAT_MARKDOWN_VISUAL.quote.border}px solid var(--cp-accent) !important; border-radius: 0 !important; padding: 2px 0 2px ${CHAT_MARKDOWN_VISUAL.quote.indent}px !important; }
 ${MD} blockquote p { font-style: italic !important; color: var(--cp-muted) !important; }
-${MD} table { border-collapse: separate !important; border-spacing: 0 !important; border: 1px solid var(--cp-rule) !important; border-radius: 8px !important; overflow: hidden !important; }
+${MD} table { border-collapse: separate !important; border-spacing: 0 !important; border: 1px solid var(--cp-rule) !important; border-radius: ${CHAT_MARKDOWN_VISUAL.blockRadius}px !important; overflow: hidden !important; }
 ${MD} > div:not(.enrm-admonition) { border-radius: 8px !important; }
-${MD} :is(th, td) { padding: 9px 14px !important; border-width: 0 0 1px !important; border-color: var(--cp-rule) !important; line-height: 1.45 !important; }
+${MD} :is(th, td) { padding: ${CHAT_MARKDOWN_VISUAL.table.vertical}px ${CHAT_MARKDOWN_VISUAL.table.horizontal}px !important; border-width: 0 0 1px !important; border-color: var(--cp-rule) !important; line-height: 1.45 !important; }
 ${MD} tbody > tr:last-child > td { border-bottom-width: 0 !important; }
 ${MD} tbody > tr { background: transparent !important; }
 ${MD} td { font-size: calc(var(--cp-content) - 1px) !important; }
 ${MD} th { background: var(--cp-raised) !important; font-size: 12px !important; font-weight: 600 !important; color: var(--cp-muted) !important; }
 ${MD} hr { border-top-color: var(--cp-rule) !important; }
-:root:not([data-cp-rt-images="native"]) ${MD} img { width: var(--cp-thumb-w) !important; height: var(--cp-thumb-h) !important; object-fit: cover !important; border: 1px solid var(--cp-rule) !important; border-radius: 8px !important; background-color: var(--cp-raised) !important; margin: 6px 8px 2px 0 !important; }
+:root:not([data-cp-rt-images="native"]) ${MD} img { width: var(--cp-thumb-w) !important; height: var(--cp-thumb-h) !important; object-fit: cover !important; border: 1px solid var(--cp-rule) !important; border-radius: ${CHAT_MARKDOWN_VISUAL.blockRadius}px !important; background-color: var(--cp-raised) !important; margin: 6px 8px 2px 0 !important; }
 ${CHAT_CHROME_CSS}`;
 
-const MONO_FALLBACK = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-const hexAlpha = (hex: string, a: number) => (/^#[0-9a-f]{6}$/i.test(hex) ? hex + Math.round(a * 255).toString(16).padStart(2, "0") : hex);
-const darker = (hex: string) =>
-  /^#[0-9a-f]{6}$/i.test(hex) ? `#${[1, 3, 5].map((i) => Math.round(parseInt(hex.slice(i, i + 2), 16) * 0.86).toString(16).padStart(2, "0")).join("")}` : hex;
 
 /** Publishes the app theme's colors and the code font as CSS variables for restyleNative. */
 export function setNativeColors(c: { surface0: string; surface1: string; surface2: string; border: string; foreground: string; foregroundMuted: string; accent: string; accentForeground: string; statusSuccess: string; statusWarning: string; statusDanger: string }) {
@@ -1575,9 +1771,9 @@ export function setNativeColors(c: { surface0: string; surface1: string; surface
     "--cp-raised": c.surface1,
     "--cp-control": c.surface2,
     "--cp-accent-fg": c.accentForeground,
-    "--cp-sunken": darker(c.surface0),
-    "--cp-rule": hexAlpha(c.border, 0.6),
-    "--cp-mono": a.monoFont ? `${a.monoFont}, ${MONO_FALLBACK}` : MONO_FALLBACK,
+    "--cp-sunken": sunken(c.surface0),
+    "--cp-rule": alpha(c.border, 0.6),
+    "--cp-mono": a.monoFont ? `${a.monoFont}, ${CHAT_MONO_FALLBACK}` : CHAT_MONO_FALLBACK,
     "--cp-code": `${a.codeSize}px`,
     "--cp-content": `${a.contentSize}px`,
     "--cp-ok": c.statusSuccess,
@@ -1728,14 +1924,14 @@ export function seriesFrom(accent: string) {
 
 /** Pele's variables in the app's colors, matching the mermaid theme below. */
 function peleCssFrom(c: Parameters<typeof setNativeColors>[0], series: string[]) {
-  const sunken = darker(c.surface0);
+  const sunk = sunken(c.surface0);
   const vars = {
-    bg: sunken,
+    bg: sunk,
     fg: c.foreground,
     muted: c.foregroundMuted,
     line: c.foregroundMuted,
     surface: c.surface1,
-    "surface-alt": mix(sunken, c.surface1, 0.4),
+    "surface-alt": mix(sunk, c.surface1, 0.4),
     border: c.border,
     accent: c.accent,
     critical: c.statusDanger,
@@ -1754,25 +1950,25 @@ const isDark = (hex: string) => /^#[0-9a-f]{6}$/i.test(hex) && [1, 3, 5].reduce(
 
 /** Mermaid's "base" theme in the app's colors: raised nodes with a 1px border, thin muted edges, accent-tinted notes. */
 function mermaidThemeFrom(c: Parameters<typeof setNativeColors>[0], series: string[]) {
-  const sunken = darker(c.surface0);
+  const sunk = sunken(c.surface0);
   // Mermaid derives shades from these, so they stay opaque hex.
   const vars = {
     darkMode: isDark(c.surface0),
-    background: sunken,
+    background: sunk,
     fontFamily: DIAGRAM_FONT,
     fontSize: "13px",
     primaryColor: c.surface1,
     primaryBorderColor: c.border,
     primaryTextColor: c.foreground,
     secondaryColor: c.surface2,
-    tertiaryColor: sunken,
+    tertiaryColor: sunk,
     mainBkg: c.surface1,
     nodeBorder: c.border,
     textColor: c.foreground,
     titleColor: c.foreground,
     lineColor: c.foregroundMuted,
-    edgeLabelBackground: sunken,
-    clusterBkg: mix(sunken, c.surface1, 0.4),
+    edgeLabelBackground: sunk,
+    clusterBkg: mix(sunk, c.surface1, 0.4),
     clusterBorder: c.border,
     actorBkg: c.surface1,
     actorBorder: c.border,
@@ -1786,31 +1982,31 @@ function mermaidThemeFrom(c: Parameters<typeof setNativeColors>[0], series: stri
     loopTextColor: c.foreground,
     activationBkgColor: c.surface2,
     activationBorderColor: c.border,
-    noteBkgColor: mix(sunken, c.accent, 0.12),
-    noteBorderColor: mix(sunken, c.accent, 0.3),
+    noteBkgColor: mix(sunk, c.accent, 0.12),
+    noteBorderColor: mix(sunk, c.accent, 0.3),
     noteTextColor: c.accent,
     rowOdd: c.surface1,
-    rowEven: mix(sunken, c.surface1, 0.5),
+    rowEven: mix(sunk, c.surface1, 0.5),
     // Pie slices, git branches and the sections of mindmaps, timelines and journeys take the chart series, which
     // "base" would otherwise shade from the gray surfaces above. Labels on them use the background, as Pele's do.
     ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`pie${i + 1}`, series[i % 8]])),
-    pieStrokeColor: sunken,
+    pieStrokeColor: sunk,
     pieOuterStrokeColor: c.border,
-    pieSectionTextColor: sunken,
+    pieSectionTextColor: sunk,
     pieTitleTextColor: c.foreground,
     pieLegendTextColor: c.foreground,
-    ...Object.fromEntries(series.flatMap((h, i) => [[`git${i}`, h], [`gitBranchLabel${i}`, sunken]])),
-    ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [[`cScale${i}`, series[i % 8]], [`cScaleLabel${i}`, sunken]]).flat()),
+    ...Object.fromEntries(series.flatMap((h, i) => [[`git${i}`, h], [`gitBranchLabel${i}`, sunk]])),
+    ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [[`cScale${i}`, series[i % 8]], [`cScaleLabel${i}`, sunk]]).flat()),
     // Passing xyChart replaces what mermaid would derive for it, so its background and axes come along.
     xyChart: {
       plotColorPalette: series.join(","),
-      backgroundColor: sunken,
+      backgroundColor: sunk,
       titleColor: c.foreground,
       ...Object.fromEntries(["x", "y"].flatMap((a) => [[`${a}AxisTitleColor`, c.foreground], [`${a}AxisLabelColor`, c.foregroundMuted], [`${a}AxisTickColor`, c.border], [`${a}AxisLineColor`, c.border]])),
     },
   };
   // ER's "zero" markers are hard-coded white.
-  const css = `${MERMAID_CSS} marker[id*="zeroOr"] circle { fill: ${sunken}; }`;
+  const css = `${MERMAID_CSS} marker[id*="zeroOr"] circle { fill: ${sunk}; }`;
   return `theme:"base",themeVariables:${JSON.stringify(vars)},themeCSS:${JSON.stringify(css)}`;
 }
 
@@ -1935,6 +2131,20 @@ function themeMermaid(enabled: () => boolean, pele?: PeleDiagrams) {
   };
 }
 
+const label = (button: DomElement | null | undefined) => Array.from(button?.querySelectorAll("*") ?? []).find((el) => !el.firstElementChild && el.textContent?.trim());
+
+/**
+ * A permission action button when it is drawn as `part`. Paseo draws every action in the same box and marks the primary one only by
+ * its label color (foreground rather than muted), so it is compared with Deny's, which is never primary. Read once per button, in a
+ * card that rarely shows, so the style read costs nothing while the timeline scrolls.
+ */
+function actionAs(el: DomElement, part: "primary" | "secondary") {
+  if (el.hasAttribute("data-cp-part")) return null;
+  const own = label(el), deny = label(el.parentElement?.querySelector('[data-testid="permission-request-deny"]'));
+  const primary = !!own && !!deny && getComputedStyle(own).color !== getComputedStyle(deny).color;
+  return (primary ? "primary" : "secondary") === part ? el : null;
+}
+
 // [child, parent it marks, part]
 const PARTS: Array<[string, (el: DomElement) => DomElement | null | undefined, string]> = [
   ['[data-testid="assistant-fork-menu-trigger"]', (el) => el.parentElement, "fork"],
@@ -1960,6 +2170,8 @@ const PARTS: Array<[string, (el: DomElement) => DomElement | null | undefined, s
   ['[data-testid="message-input-root"] textarea', (el) => el.parentElement?.parentElement, "input-row"],
   [PRIMARY, (el) => el, "primary"],
   [SECONDARY, (el) => el, "secondary"],
+  [ACTION, (el) => actionAs(el, "primary"), "primary"],
+  [ACTION, (el) => actionAs(el, "secondary"), "secondary"],
   [`${PLAN} > button:first-child`, (el) => el, "plan-head"],
   ['[data-testid="chat-outline-preview"]', (el) => el, "outline-preview"],
   ['[data-testid="context-window-details"]', (el) => el, "context"],
@@ -2442,10 +2654,10 @@ const TASK_ITEM = `${MSG} ${md("li")}[data-cp-task]`;
 const TASK = `:root ${TASK_ITEM}`;
 
 const RICH_TEXT_CSS = `
-${RT("quote", "b")} ${QUOTE} { border-left-width: 0 !important; border-radius: 8px !important; background: var(--cp-raised) !important; padding: 10px 14px 10px 36px !important; position: relative !important; }
+${RT("quote", "b")} ${QUOTE} { border-left-width: 0 !important; border-radius: ${CHAT_MARKDOWN_VISUAL.blockRadius}px !important; background: var(--cp-raised) !important; padding: ${CHAT_MARKDOWN_VISUAL.quote.cardVertical}px ${CHAT_MARKDOWN_VISUAL.quote.cardHorizontal}px ${CHAT_MARKDOWN_VISUAL.quote.cardVertical}px 36px !important; position: relative !important; }
 ${RT("quote", "b")} ${QUOTE}::before { content: "\\201C"; position: absolute; left: 13px; top: 6px; font-size: 24px; line-height: 1; font-weight: 600; color: var(--cp-accent); }
 ${RT("quote", "b")} ${QUOTE} span { font-style: normal !important; color: var(--cp-fg) !important; }
-${RT("quote", "c")} ${QUOTE} { border-left-width: 0 !important; padding: 0 0 0 20px !important; }
+${RT("quote", "c")} ${QUOTE} { border-left-width: 0 !important; padding: 0 0 0 ${CHAT_MARKDOWN_VISUAL.quote.plainIndent}px !important; }
 
 ${RT("table", "b")} ${md("table")} { border-width: 0 !important; border-radius: 6px !important; }
 ${RT("table", "b")} ${md("table")} > div:first-child { background: transparent !important; }
@@ -2454,7 +2666,7 @@ ${RT("table", "b")} ${md("table")} > div:last-child > div:nth-child(odd) { backg
 ${RT("table", "c")} ${md("table")} { border-width: 0 !important; border-radius: 0 !important; }
 ${RT("table", "c")} ${md("table")} > div:first-child { background: transparent !important; }
 ${RT("table", "c")} ${md("table")} > div:last-child > div { border-bottom-width: 0 !important; }
-${RT("table", "c")} ${md("table")} > div > div > div { padding: 7px 12px 7px 0 !important; }
+${RT("table", "c")} ${md("table")} > div > div > div { padding: ${CHAT_MARKDOWN_VISUAL.table.compactVertical}px 12px ${CHAT_MARKDOWN_VISUAL.table.compactVertical}px 0 !important; }
 ${RT("table", "d")} ${md("table")} > div > div > div:not(:last-child) { border-right: 1px solid var(--cp-rule) !important; }
 
 ${RT("code", "b")} ${md("pre")} { border-width: 0 !important; }
@@ -2469,9 +2681,9 @@ ${RT("code", "c")} ${md("pre")} > div:first-child::before { content: attr(data-c
 ${RT("inline", "b")} ${INLINE_CODE} { background: transparent !important; padding: 0 1px !important; color: var(--cp-warn) !important; }
 ${RT("inline", "c")} ${INLINE_CODE} { background: transparent !important; box-shadow: inset 0 0 0 1px var(--cp-rule) !important; }
 
-${RT("heading", "b")} ${HEADING(1)} { font-size: 18px !important; display: inline-block !important; width: 100% !important; padding-bottom: 6px !important; border-bottom: 1px solid var(--cp-rule) !important; }
-${RT("heading", "b")} ${HEADING(2)} { font-size: 15px !important; }
-${RT("heading", "b")} ${HEADING(3)} { font-size: 12px !important; text-transform: uppercase !important; letter-spacing: 0.06em !important; color: var(--cp-muted) !important; }
+${RT("heading", "b")} ${HEADING(1)} { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.compact[0]}px !important; display: inline-block !important; width: 100% !important; padding-bottom: ${CHAT_MARKDOWN_VISUAL.headingUnderlinePadding}px !important; border-bottom: 1px solid var(--cp-rule) !important; }
+${RT("heading", "b")} ${HEADING(2)} { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.compact[1]}px !important; }
+${RT("heading", "b")} ${HEADING(3)} { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.compact[2]}px !important; text-transform: uppercase !important; letter-spacing: 0.06em !important; color: var(--cp-muted) !important; }
 ${RT("heading", "c")} ${HEADING(1)}, ${RT("heading", "c")} ${HEADING(2)} { border-left: 3px solid var(--cp-accent) !important; padding-left: 10px !important; }
 ${RT("heading", "c")} ${HEADING(3)}::before { content: "### "; font-family: var(--cp-mono); font-size: var(--cp-code); font-weight: 400; color: var(--cp-muted); }
 
@@ -2510,13 +2722,13 @@ ${RT("callout", "c")} ${CALLOUT} [data-cp-callout-mark]::after { content: attr(d
 ${MSG} ${md("hr")} { margin: 8px 0 !important; background: var(--cp-rule) !important; }
 ${RT("rule", "b")} ${md("hr")} { height: auto !important; background: transparent !important; text-align: center; }
 ${RT("rule", "b")} ${md("hr")}::before { content: "\\2022  \\2022  \\2022"; font-size: 12px; letter-spacing: 0.2em; color: var(--cp-muted); }
-${RT("rule", "c")} ${md("hr")} { width: 48px !important; background: var(--cp-border, var(--cp-rule)) !important; }
+${RT("rule", "c")} ${md("hr")} { width: ${CHAT_MARKDOWN_VISUAL.ruleWidth}px !important; background: var(--cp-border, var(--cp-rule)) !important; }
 
 /* The variants on Paseo 0.12's renderer (see MD). Callouts and task boxes are Paseo's own there; markBlocks tags a callout's kind. */
-${RT("quote", "b")} .enrm-text blockquote { border-inline-start-width: 0 !important; border-radius: 8px !important; background: var(--cp-raised) !important; padding: 10px 14px 10px 36px !important; position: relative !important; }
+${RT("quote", "b")} .enrm-text blockquote { border-inline-start-width: 0 !important; border-radius: ${CHAT_MARKDOWN_VISUAL.blockRadius}px !important; background: var(--cp-raised) !important; padding: ${CHAT_MARKDOWN_VISUAL.quote.cardVertical}px ${CHAT_MARKDOWN_VISUAL.quote.cardHorizontal}px ${CHAT_MARKDOWN_VISUAL.quote.cardVertical}px 36px !important; position: relative !important; }
 ${RT("quote", "b")} .enrm-text blockquote::before { content: "\\201C"; position: absolute; left: 13px; top: 6px; font-size: 24px; line-height: 1; font-weight: 600; color: var(--cp-accent); }
 ${RT("quote", "b")} .enrm-text blockquote p { font-style: normal !important; color: var(--cp-fg) !important; }
-${RT("quote", "c")} .enrm-text blockquote { border-inline-start-width: 0 !important; padding: 0 0 0 20px !important; }
+${RT("quote", "c")} .enrm-text blockquote { border-inline-start-width: 0 !important; padding: 0 0 0 ${CHAT_MARKDOWN_VISUAL.quote.plainIndent}px !important; }
 
 ${RT("table", "b")} .enrm-text table { border-width: 0 !important; border-radius: 6px !important; }
 ${RT("table", "b")} .enrm-text th { background: transparent !important; }
@@ -2527,15 +2739,15 @@ ${RT("table", "b")} .enrm-text td:last-child { border-radius: 0 6px 6px 0 !impor
 ${RT("table", "c")} .enrm-text table { border-width: 0 !important; border-radius: 0 !important; }
 ${RT("table", "c")} .enrm-text th { background: transparent !important; }
 ${RT("table", "c")} .enrm-text td { border-bottom-width: 0 !important; }
-${RT("table", "c")} .enrm-text :is(th, td) { padding: 7px 12px 7px 0 !important; }
+${RT("table", "c")} .enrm-text :is(th, td) { padding: ${CHAT_MARKDOWN_VISUAL.table.compactVertical}px 12px ${CHAT_MARKDOWN_VISUAL.table.compactVertical}px 0 !important; }
 ${RT("table", "d")} .enrm-text :is(th, td):not(:last-child) { border-right: 1px solid var(--cp-rule) !important; }
 
 ${RT("inline", "b")} .enrm-text code { background: transparent !important; padding: 0 1px !important; color: var(--cp-warn) !important; }
 ${RT("inline", "c")} .enrm-text code { background: transparent !important; box-shadow: inset 0 0 0 1px var(--cp-rule) !important; }
 
-${RT("heading", "b")} .enrm-text h1 { font-size: 18px !important; padding-bottom: 6px !important; border-bottom: 1px solid var(--cp-rule) !important; }
-${RT("heading", "b")} .enrm-text h2 { font-size: 15px !important; }
-${RT("heading", "b")} .enrm-text h3 { font-size: 12px !important; text-transform: uppercase !important; letter-spacing: 0.06em !important; color: var(--cp-muted) !important; }
+${RT("heading", "b")} .enrm-text h1 { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.compact[0]}px !important; padding-bottom: ${CHAT_MARKDOWN_VISUAL.headingUnderlinePadding}px !important; border-bottom: 1px solid var(--cp-rule) !important; }
+${RT("heading", "b")} .enrm-text h2 { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.compact[1]}px !important; }
+${RT("heading", "b")} .enrm-text h3 { font-size: ${CHAT_MARKDOWN_VISUAL.headingSizes.compact[2]}px !important; text-transform: uppercase !important; letter-spacing: 0.06em !important; color: var(--cp-muted) !important; }
 ${RT("heading", "c")} .enrm-text :is(h1, h2) { border-left: 3px solid var(--cp-accent) !important; padding-left: 10px !important; }
 ${RT("heading", "c")} .enrm-text h3::before { content: "### "; font-family: var(--cp-mono); font-size: var(--cp-code); font-weight: 400; color: var(--cp-muted); }
 
@@ -2572,7 +2784,7 @@ ${RT("callout", "c")} .enrm-admonition p { display: inline !important; }
 
 ${RT("rule", "b")} .enrm-text hr { border-top-width: 0 !important; height: auto !important; text-align: center; }
 ${RT("rule", "b")} .enrm-text hr::before { content: "\\2022  \\2022  \\2022"; font-size: 12px; letter-spacing: 0.2em; color: var(--cp-muted); }
-${RT("rule", "c")} .enrm-text hr { width: 48px !important; border-top-color: var(--cp-border, var(--cp-rule)) !important; }
+${RT("rule", "c")} .enrm-text hr { width: ${CHAT_MARKDOWN_VISUAL.ruleWidth}px !important; border-top-color: var(--cp-border, var(--cp-rule)) !important; }
 `;
 
 /**

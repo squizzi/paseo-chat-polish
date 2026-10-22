@@ -3,7 +3,7 @@ import type { PluginClientContext, PluginSidebarItemProps } from "@getpaseo/plug
 import { copyText, useToast, type ToastApi } from "@getpaseo/plugin/client/react-native";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { useEffect } from "react";
-import { z } from "zod";
+import { Platform } from "react-native";
 import { Dashboard } from "./client/dashboard";
 import { clearImageCache } from "./client/images";
 import { sidebarIcon } from "./client/mark";
@@ -12,11 +12,12 @@ import { followAgent, isTodo, onShownAgent, onStaleSteps, onUnplacedStep, placeS
 import { renderDiagram } from "./shared/diagram";
 import { currentPrefs, savePrefs, setPrefs, subscribePrefs, usePrefsSaver } from "./client/prefs";
 import { bindThemeRegistry, currentTheme, registerTheme } from "./client/theme-registry";
-import { addIconSet, bindPromptKeys, clampUserMessages, iconTwins, jumpToPrompt, openAgentIds, paintSidebar, redrawDiagrams, setCompactHandler, readHostAppearance, restyleNative, selectionCopyMenu, setNativeColors, setRailProviders, setRichText, smoothStreamingText, stylePluginViews, nativeIconSet, watchDom } from "./client/web";
+import { addIconSet, bindPromptKeys, clampUserMessages, iconTwins, installChatMotion, jumpToPrompt, openAgentIds, paintSidebar, redrawDiagrams, setCompactHandler, readHostAppearance, restyleNative, selectionCopyMenu, setNativeColors, setRailProviders, setRichText, stylePluginViews, nativeIconSet, watchDom } from "./client/web";
 import { getTheme, THEME_CATALOG_ID, themeSchema } from "./shared/theme";
 import { getIconSet, getPrefs, type Prefs } from "./shared/timeline";
 import { HtmlItem, ImagesItem, NoticeItem, PlanItem, RecapItem, StepsItem, ThoughtItem, TodoItem, ToolItem } from "./client/views";
-import { StreamingAssistant } from "./client/streaming-markdown";
+import { StreamingAssistant, streamingAssistantSchema } from "./client/streaming-markdown";
+import { STREAM_FADE_DURATION_MS } from "./client/streaming-token-motion";
 import { htmlData, htmlSchema } from "./client/html";
 import { recapSchema } from "./shared/recap";
 
@@ -56,7 +57,7 @@ export default function contribute(client: PluginClientContext) {
   const unclamp = clampUserMessages(() => currentPrefs().userMessages === "clamp");
   const unselect = selectionCopyMenu(() => currentPrefs().selectionCopy === "on");
   const unicons = nativeIconSet(() => currentPrefs().iconSet);
-  const unsmoothText = smoothStreamingText(() => currentPrefs().motion, subscribePrefs);
+  const uninstallChatMotion = installChatMotion(() => currentPrefs().motion, subscribePrefs);
 
   // The composer's model selector rail lists every provider, which Paseo only renders for new chats.
   const loadProviders = () =>
@@ -108,16 +109,72 @@ export default function contribute(client: PluginClientContext) {
     return one("todo", todoData(item));
   };
 
+  interface StreamHold {
+    text: string;
+    updatedAt: number;
+    holdUntil: number;
+    timer?: ReturnType<typeof setTimeout>;
+  }
+  const streamHolds: StreamHold[] = [];
+  let removeStreamingTransformers = () => {};
+  const addStreamingTransformers = () => {
+    removeStreamingTransformers();
+    const removers = [
+      ...(Platform.OS === "web" ? [
+        client.addTimelineTransformer({
+          id: `${KIND}-streaming-assistant`,
+          query: { itemType: "assistant_message" },
+          transform: ({ item, phase }) => {
+            const now = Date.now();
+            for (let i = streamHolds.length - 1; i >= 0; i--) {
+              const entry = streamHolds[i]!;
+              if (now >= entry.holdUntil && !entry.timer) streamHolds.splice(i, 1);
+            }
+            if (!currentPrefs().motion) return undefined;
+            if (phase === "streaming") {
+              const existing = streamHolds.find((entry) =>
+                now - entry.updatedAt < 30000
+                && (item.text === entry.text || item.text.startsWith(entry.text) || entry.text.startsWith(item.text)));
+              const holdUntil = now + STREAM_FADE_DURATION_MS + 24;
+              if (existing) {
+                existing.text = item.text;
+                existing.updatedAt = now;
+                existing.holdUntil = holdUntil;
+              } else {
+                streamHolds.push({ text: item.text, updatedAt: now, holdUntil });
+              }
+              return one("streaming-assistant", { text: item.text });
+            }
+            const hold = streamHolds.find((entry) => now < entry.holdUntil && entry.text === item.text)
+              ?? streamHolds.find((entry) => now < entry.holdUntil && entry.text.length > 0 && item.text.startsWith(entry.text));
+            if (!hold) return undefined;
+            if (item.text !== hold.text) {
+              hold.text = item.text;
+              hold.updatedAt = now;
+              hold.holdUntil = now + STREAM_FADE_DURATION_MS + 24;
+              if (hold.timer) {
+                clearTimeout(hold.timer);
+                hold.timer = undefined;
+              }
+            }
+            hold.timer ??= setTimeout(() => {
+              hold.timer = undefined;
+              const index = streamHolds.indexOf(hold);
+              if (index >= 0) streamHolds.splice(index, 1);
+              addStreamingTransformers();
+            }, Math.max(16, hold.holdUntil - now));
+            return one("streaming-assistant", { text: item.text });
+          },
+        }),
+      ] : []),
+    ];
+    removeStreamingTransformers = () => removers.forEach((r) => void r());
+  };
+  addStreamingTransformers();
+
   // Transformers read prefs when they run; re-register when hiding or images change so Paseo re-transforms.
   const addTransformers = () => {
     const removers = [
-      client.addTimelineTransformer({
-        id: `${KIND}-streaming-assistant`,
-        query: { itemType: "assistant_message" },
-        transform: ({ item, phase }) => phase === "streaming" && currentPrefs().motion
-          ? one("streaming-assistant", { text: item.text })
-          : undefined,
-      }),
       client.addTimelineTransformer({
         id: `${KIND}-tool`,
         query: { itemType: "tool_call" },
@@ -143,9 +200,9 @@ export default function contribute(client: PluginClientContext) {
       client.addTimelineTransformer({
         id: `${KIND}-images`,
         query: { itemType: "assistant_message" },
-        transform: ({ item }) => {
+        transform: ({ item, phase }) => {
           const data = currentPrefs().images === "native" ? undefined : imageData(item.text);
-          return data ? one("images", data) : undefined;
+          return data ? one("images", { ...data, phase }) : undefined;
         },
       }),
       // Todo updates fold into the merged row around them (what changed comes from the followed timeline); otherwise each is one row.
@@ -163,14 +220,18 @@ export default function contribute(client: PluginClientContext) {
     return () => removers.forEach((r) => void r());
   };
   let removeTransformers = addTransformers();
+  let lastMotion = currentPrefs().motion;
   const inputs = () => [currentPrefs().images, currentPrefs().hidden.join(), currentPrefs().merge, currentPrefs().motion, readHostAppearance().toolCallDetail].join("|");
   let transformedWith = inputs();
   const retransform = (force = false) => {
     if (!force && inputs() === transformedWith) return;
+    const motionChanged = currentPrefs().motion !== lastMotion;
+    lastMotion = currentPrefs().motion;
     transformedWith = inputs();
     removeTransformers();
     resetMade();
     removeTransformers = addTransformers();
+    if (motionChanged) addStreamingTransformers();
   };
   // A step transformed before its run was known renders wrong until Paseo transforms again; batch those.
   let staleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -259,7 +320,9 @@ export default function contribute(client: PluginClientContext) {
   client.addTimelineRenderer({ kind: `${KIND}-steps`, version: 1, schema: stepsSchema, Component: StepsItem });
   client.addTimelineRenderer({ kind: `${KIND}-recap`, version: 1, schema: recapSchema, Component: RecapItem });
   client.addTimelineRenderer({ kind: `${KIND}-html`, version: 1, schema: htmlSchema, Component: HtmlItem });
-  client.addTimelineRenderer({ kind: `${KIND}-streaming-assistant`, version: 1, schema: z.object({ text: z.string() }), Component: StreamingAssistant });
+  if (Platform.OS === "web") {
+    client.addTimelineRenderer({ kind: `${KIND}-streaming-assistant`, version: 1, schema: streamingAssistantSchema, Component: StreamingAssistant });
+  }
 
   const unbindPromptKeys = bindPromptKeys();
   for (const [id, title, direction] of [["previous-prompt", "Previous prompt", -1], ["next-prompt", "Next prompt", 1]] as const) {
@@ -323,13 +386,16 @@ export default function contribute(client: PluginClientContext) {
     unsubscribePrefs();
     unwatchHost();
     clearTimeout(staleTimer);
+    for (const hold of streamHolds) clearTimeout(hold.timer);
+    streamHolds.length = 0;
     followed.forEach((stop) => stop());
+    removeStreamingTransformers();
     removeTransformers();
     unpaintSidebar();
     unclamp();
     unselect();
     unicons();
-    unsmoothText();
+    uninstallChatMotion();
     unsubscribeProviders();
     unrestyle();
     unstylePluginViews();

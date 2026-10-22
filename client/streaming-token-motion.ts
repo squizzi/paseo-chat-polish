@@ -13,6 +13,43 @@ export interface StreamFadeState {
   chunks: StreamFadeChunk[];
 }
 
+export interface StreamArrivalRegistry {
+  /** Claims an unseen live item once. */
+  claim(key: string, eligible: boolean): boolean;
+  /** Remembers later snapshots of the same mounted item for tab remounts. */
+  remember(key: string): void;
+}
+
+/** Bounded session memory for live assistant snapshots across tab remounts. */
+export function createStreamArrivalRegistry(limit = 2000): StreamArrivalRegistry {
+  const seen = new Set<string>();
+  const remember = (key: string) => {
+    if (seen.has(key)) seen.delete(key);
+    seen.add(key);
+    while (seen.size > limit) seen.delete(seen.values().next().value!);
+  };
+  return {
+    claim(key, eligible) {
+      if (!eligible || seen.has(key)) return false;
+      remember(key);
+      return true;
+    },
+    remember,
+  };
+}
+
+/** The first live snapshot fades once; restored/remounted snapshots start settled. */
+export function initialFadeState(
+  text: string,
+  enabled: boolean,
+  animateInitial: boolean,
+  now: number,
+): StreamFadeState {
+  return animateInitial
+    ? nextFadeState({ committed: "", chunks: [] }, text, enabled, now)
+    : { committed: text, chunks: [] };
+}
+
 export function nextFadeState(
   state: StreamFadeState,
   text: string,

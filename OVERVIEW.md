@@ -1,4 +1,4 @@
-Chat Polish customizes Paseo’s chat timeline, rich text, themes and fonts from a live preview dashboard. It can display tool calls as compact rows, merge thoughts and tool calls between replies, add eased motion around Paseo’s paced reply renderer, show animated image previews, and add turn recaps.
+Chat Polish customizes Paseo’s chat timeline, rich text, themes and fonts from a live preview dashboard. It can display tool calls as compact rows, merge thoughts and tool calls between replies, add eased motion around Paseo’s paced reply updates, show animated image previews, and add turn recaps.
 
 Requires Paseo 0.12.0 or newer, Node.js 20.9+ and npm on the daemon host for its locked dependency preparation. Open Chat Polish in the sidebar to configure themes, messages, steps and rich text. Chat motion is on by default and can be disabled there. Individual tool rows require Settings → Appearance → Tool call display set to Detailed.
 

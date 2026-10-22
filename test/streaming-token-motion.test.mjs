@@ -7,12 +7,29 @@ const source = readFileSync(new URL("../client/streaming-token-motion.ts", impor
 const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
 const module = { exports: {} };
 new Function("exports", "module", js)(module.exports, module);
-const { nextFadeState, settleFadeState, STREAM_TOKEN_PREROLL_MS, STREAM_TOKEN_FADE_MS, STREAM_FADE_DURATION_MS } = module.exports;
+const { createStreamArrivalRegistry, initialFadeState, nextFadeState, settleFadeState, STREAM_TOKEN_PREROLL_MS, STREAM_TOKEN_FADE_MS, STREAM_FADE_DURATION_MS } = module.exports;
 
 test("streamed text waits briefly while chat-follow motion gets a head start", () => {
   assert.equal(STREAM_TOKEN_PREROLL_MS, 36);
   assert.equal(STREAM_TOKEN_FADE_MS, 320);
   assert.equal(STREAM_FADE_DURATION_MS, STREAM_TOKEN_PREROLL_MS + STREAM_TOKEN_FADE_MS);
+});
+
+test("a live tab's first snapshot fades once without replaying after later snapshot remounts", () => {
+  const arrivals = createStreamArrivalRegistry();
+  assert.equal(arrivals.claim("child:100", true), true);
+  assert.deepEqual(initialFadeState("Already working", true, true, 100), {
+    committed: "",
+    chunks: [{ start: 0, text: "Already working", startedAtMs: 100 }],
+  });
+
+  arrivals.remember("child:101");
+  assert.equal(arrivals.claim("child:101", true), false, "a later timestamp from the same mounted row stays settled on remount");
+  assert.deepEqual(initialFadeState("Already working more", true, false, 200), {
+    committed: "Already working more",
+    chunks: [],
+  });
+  assert.equal(arrivals.claim("child:200", true), true, "a new live reply still owns an entrance");
 });
 
 test("recent streamed arrivals overlap to form a continuously moving tail", () => {

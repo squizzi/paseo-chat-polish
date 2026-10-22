@@ -11,6 +11,11 @@ export function recallDisclosure(key: string | undefined, initial: boolean) {
   return value === undefined ? { open: initial, restored: false } : { open: value, restored: true };
 }
 
+/** Only an initially visible restored detail should skip its mount entrance. */
+export function shouldRestoreOpenDisclosure(saved: { open: boolean; restored: boolean }) {
+  return saved.open && saved.restored;
+}
+
 export function rememberDisclosure(key: string | undefined, open: boolean) {
   if (key === undefined) return;
   // Reinsert touched entries so the cap removes the least-recently-used row.
