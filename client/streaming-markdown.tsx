@@ -7,24 +7,29 @@ import {
   type HighlightStyle,
 } from "@getpaseo/highlight";
 import MarkdownIt from "markdown-it";
-import AstRenderer from "react-native-markdown-display/src/lib/AstRenderer";
-import removeTextStyleProps from "react-native-markdown-display/src/lib/util/removeTextStyleProps";
 import {
   createContext, useCallback, useContext, useEffect, useMemo, useRef, useState,
   type ReactNode,
 } from "react";
 import {
-  ActivityIndicator, Image, Platform, Pressable, StyleSheet, Text, View,
-  type TextProps, type TextStyle, type ViewStyle,
+  ActivityIndicator, Image, Platform, Pressable, Text, View,
+  type TextStyle, type ViewStyle,
 } from "react-native";
+import { z } from "zod";
 import { usePrefs } from "./prefs";
-import { chatMarkdownTypography } from "./chat-markdown-style";
+import { CHAT_MARKDOWN_DENSITY, CHAT_MARKDOWN_VISUAL, chatMarkdownTypography } from "./chat-markdown-style";
 import {
   getMarkdownListMarker,
   isInlineCodeLink,
   type MarkdownParserLike,
 } from "./markdown-compat";
-import { renderStableMarkdown } from "./stable-markdown-parser";
+import {
+  createMarkdownAstRenderer,
+  renderStableMarkdown,
+  type MarkdownAstNode,
+  type MarkdownRenderRules,
+  type MarkdownStyleMap,
+} from "./markdown-renderer-adapter";
 import { enableStreamingMarkdown } from "./streaming-markdown-parser";
 import { readHostAppearance } from "./web";
 import type { Prefs } from "../shared/timeline";
@@ -35,24 +40,14 @@ import {
   type StreamFadeChunk,
   type StreamFadeState,
 } from "./streaming-token-motion";
-import { streamingImageFrameSize, type StreamingImageMode } from "./streaming-image-layout";
+import { IMAGE_ARRIVAL_PROPS, streamingImageFrameSize, type StreamingImageMode } from "./streaming-image-layout";
 
-interface ASTNode {
-  type: string;
-  key: string;
-  content: string;
-  index: number;
-  markup: string;
-  sourceInfo?: unknown;
-  attributes: Record<string, unknown>;
-  children: ASTNode[];
-}
-type RenderRule = (...args: any[]) => ReactNode;
-type RenderRules = Record<string, RenderRule | undefined>;
+type ASTNode = MarkdownAstNode;
+type RenderRules = MarkdownRenderRules;
 
 const STREAM_TOKEN_PROPS = {
   dataSet: { cpStreamToken: "true" },
-} as unknown as TextProps;
+} as object;
 
 const MARKDOWN_TAG: Readonly<Record<string, string>> = {
   heading1: "h1", heading2: "h2", heading3: "h3", heading4: "h4", heading5: "h5", heading6: "h6",
@@ -64,9 +59,10 @@ const MARKDOWN_TAG: Readonly<Record<string, string>> = {
 
 const MARKDOWN_ROLE = (role: string) => ({
   dataSet: { chatPolishMarkdownRole: role, paseoMarkdownTag: MARKDOWN_TAG[role] ?? role },
-}) as unknown as TextProps;
+}) as object;
 
-interface StreamingAssistantData { text: string }
+export const streamingAssistantSchema = z.object({ text: z.string() });
+type StreamingAssistantData = z.output<typeof streamingAssistantSchema>;
 interface StreamFadeValue {
   source: string;
   committedLength: number;
@@ -142,6 +138,12 @@ export function StreamFadeText({ content }: { content: string }): ReactNode {
   });
 }
 
+function isNewStreamImage(fade: StreamFadeValue | null, source: string) {
+  if (!fade?.chunks.length) return false;
+  const sourceIndex = fade.source.lastIndexOf(source);
+  return sourceIndex >= 0 && fade.chunks.some((chunk) => sourceIndex >= chunk.start && sourceIndex < chunk.start + chunk.text.length);
+}
+
 function StreamingMarkdownImage({
   source, alt, style, hasLeadingContent, theme, imageMode,
 }: {
@@ -153,6 +155,7 @@ function StreamingMarkdownImage({
     status: "loading",
   }));
   const fade = useContext(StreamFadeContext);
+  const [animateArrival] = useState(() => isNewStreamImage(fade, source));
   const aspectRatio = measurement?.source === source ? measurement.aspectRatio : null;
   const status = loadState.source === source ? loadState.status : "loading";
   const fixedFrame = streamingImageFrameSize(Platform.OS, imageMode);
@@ -181,7 +184,7 @@ function StreamingMarkdownImage({
           fixedFrame ? null : measuredSizeStyle,
           { alignItems: "center", justifyContent: "center", paddingHorizontal: 16, paddingVertical: 24 },
         ]}
-        {...(fade?.chunks.length ? STREAM_TOKEN_PROPS as any : {})}
+        {...(fade?.chunks.length ? STREAM_TOKEN_PROPS : {})}
       >
         <Text style={{ color: theme.colors.foregroundMuted, fontSize: 14, textAlign: "center" }}>
           Unable to load image.
@@ -193,7 +196,8 @@ function StreamingMarkdownImage({
   return (
     <View
       style={frameStyle}
-      {...(fade?.chunks.length ? STREAM_TOKEN_PROPS as any : {})}
+      {...(fade?.chunks.length ? STREAM_TOKEN_PROPS : {})}
+      {...(status === "loaded" && animateArrival ? IMAGE_ARRIVAL_PROPS : {})}
     >
       <View style={[{ width: "100%", overflow: "hidden", position: "relative" }, imageBoxStyle]}>
         <Image
@@ -249,7 +253,7 @@ function HighlightedStreamingCode({
   node: ASTNode;
   type: "code_block" | "fence";
   inherited: TextStyle;
-  styles: any;
+  styles: MarkdownStyleMap;
   theme: PluginTheme;
 }) {
   const code = node.content.replace(/\n$/, "");
@@ -266,7 +270,7 @@ function HighlightedStreamingCode({
     color,
   };
   return (
-    <View key={node.key} {...MARKDOWN_ROLE(type) as any} style={[boxStyle, { position: "relative" }]}>
+    <View key={node.key} {...MARKDOWN_ROLE(type)} style={[boxStyle, { position: "relative" }]}>
       <Text style={[inherited, textStyle]}>
         {lines.flatMap((line, lineIndex) => {
           const pieces: ReactNode[] = [];
@@ -291,13 +295,13 @@ function HighlightedStreamingCode({
 }
 
 function createRenderRules(theme: PluginTheme, markdownParser: MarkdownParserLike, preferences: Prefs): RenderRules {
-  const container = (type: string) => (node: ASTNode, children: ReactNode[], _parents: ASTNode[], styles: any) => (
-    <View key={node.key} style={styles["_VIEW_SAFE_" + type]} {...MARKDOWN_ROLE(type) as any}>{children}</View>
+  const container = (type: string) => (node: ASTNode, children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap) => (
+    <View key={node.key} style={styles["_VIEW_SAFE_" + type]} {...MARKDOWN_ROLE(type)}>{children}</View>
   );
-  const span = (type: string) => (node: ASTNode, children: ReactNode[], _parents: ASTNode[], styles: any) => (
+  const span = (type: string) => (node: ASTNode, children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap) => (
     <Text key={node.key} style={styles[type]} {...MARKDOWN_ROLE(type)}>{children}</Text>
   );
-  const code = (type: string) => (node: ASTNode, _children: ReactNode[], parents: ASTNode[], styles: any, inherited: TextStyle = {}) => {
+  const code = (type: string) => (node: ASTNode, _children: ReactNode[], parents: ASTNode[], styles: MarkdownStyleMap, inherited: TextStyle = {}) => {
     const content = node.content.replace(/\n$/, "");
     const usesLinkColor = type === "code_inline" && isInlineCodeLink(content, parents, markdownParser);
     return (
@@ -306,24 +310,29 @@ function createRenderRules(theme: PluginTheme, markdownParser: MarkdownParserLik
       </Text>
     );
   };
+  const highlighted = (type: "code_block" | "fence") => (
+    node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap, inherited: TextStyle = {},
+  ) => (
+    <HighlightedStreamingCode node={node} type={type} inherited={inherited} styles={styles} theme={theme} />
+  );
   return {
     unknown: () => null,
     body: container("body"),
     heading1: container("heading1"), heading2: container("heading2"),
     heading3: container("heading3"), heading4: container("heading4"),
     heading5: container("heading5"), heading6: container("heading6"),
-    hr: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: any) => preferences.richText.rule === "b"
+    hr: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap) => preferences.richText.rule === "b"
       ? <Text key={node.key} style={{ color: theme.colors.foregroundMuted, fontSize: 12, letterSpacing: 3, textAlign: "center" }}>• • •</Text>
-      : <View key={node.key} style={styles._VIEW_SAFE_hr} {...MARKDOWN_ROLE("hr") as any} />,
+      : <View key={node.key} style={styles._VIEW_SAFE_hr} {...MARKDOWN_ROLE("hr")} />,
     strong: span("strong"), em: span("em"), s: span("s"),
     blockquote: container("blockquote"),
-    bullet_list: (node: ASTNode, children: ReactNode[], parents: ASTNode[], styles: any) => (
+    bullet_list: (node: ASTNode, children: ReactNode[], parents: ASTNode[], styles: MarkdownStyleMap) => (
       <View key={node.key} style={[styles._VIEW_SAFE_bullet_list, markdownListSpacing(node, parents)]}>{children}</View>
     ),
-    ordered_list: (node: ASTNode, children: ReactNode[], parents: ASTNode[], styles: any) => (
+    ordered_list: (node: ASTNode, children: ReactNode[], parents: ASTNode[], styles: MarkdownStyleMap) => (
       <View key={node.key} style={[styles._VIEW_SAFE_ordered_list, markdownListSpacing(node, parents)]}>{children}</View>
     ),
-    list_item: (node: ASTNode, children: ReactNode[], parents: ASTNode[], styles: any) => {
+    list_item: (node: ASTNode, children: ReactNode[], parents: ASTNode[], styles: MarkdownStyleMap) => {
       const { isOrdered, marker } = getMarkdownListMarker(node, parents);
       const displayMarker = preferences.richText.list === "c"
         ? "·"
@@ -334,7 +343,7 @@ function createRenderRules(theme: PluginTheme, markdownParser: MarkdownParserLik
         <View key={node.key} style={styles._VIEW_SAFE_list_item}>
           <Text
             style={isOrdered ? styles.ordered_list_icon : styles.bullet_list_icon}
-            {...({ dataSet: { paseoMarkdownListMarker: "" } } as any)}
+            {...({ dataSet: { paseoMarkdownListMarker: "" } } as object)}
           >
             {displayMarker}
           </Text>
@@ -345,25 +354,21 @@ function createRenderRules(theme: PluginTheme, markdownParser: MarkdownParserLik
       );
     },
     code_inline: code("code_inline"),
-    code_block: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: any, inherited: TextStyle = {}) => (
-      <HighlightedStreamingCode node={node} type="code_block" inherited={inherited} styles={styles} theme={theme} />
-    ),
-    fence: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: any, inherited: TextStyle = {}) => (
-      <HighlightedStreamingCode node={node} type="fence" inherited={inherited} styles={styles} theme={theme} />
-    ),
+    code_block: highlighted("code_block"),
+    fence: highlighted("fence"),
     table: container("table"), thead: container("thead"), tbody: container("tbody"),
     th: container("th"), tr: container("tr"), td: container("td"),
-    link: (node: ASTNode, children: ReactNode[], _parents: ASTNode[], styles: any, onLinkPress: (url: string) => boolean) => (
+    link: (node: ASTNode, children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap, onLinkPress: (url: string) => boolean) => (
       <Text key={node.key} style={styles.link} accessibilityRole="link" onPress={() => onLinkPress(String(node.attributes.href ?? ""))}>
         {children}
       </Text>
     ),
-    blocklink: (node: ASTNode, children: ReactNode[], _parents: ASTNode[], styles: any, onLinkPress: (url: string) => boolean) => (
+    blocklink: (node: ASTNode, children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap, onLinkPress: (url: string) => boolean) => (
       <Pressable key={node.key} style={styles._VIEW_SAFE_blocklink} onPress={() => onLinkPress(String(node.attributes.href ?? ""))}>
         {children}
       </Pressable>
     ),
-    image: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: any, allowed: string[]) => {
+    image: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap, allowed: string[]) => {
       const source = String(node.attributes.src ?? "");
       if (!allowed.some((handler) => source.toLowerCase().startsWith(handler))) return null;
       const alt = String(node.attributes.alt ?? "");
@@ -381,12 +386,12 @@ function createRenderRules(theme: PluginTheme, markdownParser: MarkdownParserLik
         />
       );
     },
-    text: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: any, inherited: TextStyle = {}) => (
+    text: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap, inherited: TextStyle = {}) => (
       <Text key={node.key} {...MARKDOWN_ROLE("text")} style={[inherited, styles.text]}><StreamFadeText content={node.content} /></Text>
     ),
     textgroup: span("textgroup"), paragraph: container("paragraph"),
-    hardbreak: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: any) => <Text key={node.key} style={styles.hardbreak}>{"\n"}</Text>,
-    softbreak: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: any) => <Text key={node.key} style={styles.softbreak}>{"\n"}</Text>,
+    hardbreak: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap) => <Text key={node.key} style={styles.hardbreak}>{"\n"}</Text>,
+    softbreak: (node: ASTNode, _children: ReactNode[], _parents: ASTNode[], styles: MarkdownStyleMap) => <Text key={node.key} style={styles.softbreak}>{"\n"}</Text>,
     pre: container("pre"), inline: span("inline"), span: span("span"),
   };
 }
@@ -409,7 +414,6 @@ function markdownListSpacing(node: ASTNode, parents: ASTNode[]): ViewStyle {
   return { marginTop: 4, marginBottom: nextType ? (nextIsList ? 8 : 16) : 0 };
 }
 
-type MarkdownStyleMap = Record<string, TextStyle & ViewStyle>;
 const CORE_ACCENT_BRIGHT: Readonly<Record<string, string>> = {
   "#e4e4e7": "#fafafa", "#3b6fcf": "#7eaaeb", "#d97757": "#e89a7f", "#89b4fa": "#b4d0fc",
 };
@@ -443,28 +447,40 @@ function createMarkdownStyles(
   const mono = { fontFamily: typography.monoFont };
   const heading = (level: 1 | 2 | 3 | 4 | 5 | 6): TextStyle => {
     const compact = preferences.richText.heading === "b";
-    const sizes = compact ? [18, 15, 12, 12, 12, 12] : [24, 20, 16, 16, 16, 16];
+    const sizes = compact ? CHAT_MARKDOWN_VISUAL.headingSizes.compact : CHAT_MARKDOWN_VISUAL.headingSizes.standard;
     const size = sizes[level - 1]!;
     return {
       ...ui,
       color: level === 3 && compact ? c.foregroundMuted : c.foreground,
       fontSize: size,
-      lineHeight: Math.round(size * 1.3),
+      lineHeight: Math.round(size * CHAT_MARKDOWN_VISUAL.headingLineHeight),
       fontWeight: "600",
       marginTop: 0,
       marginBottom: 0,
-      ...(level === 1 && compact ? { borderBottomWidth: 1, borderBottomColor: c.border, paddingBottom: 6 } : {}),
+      ...(level === 1 && compact ? { borderBottomWidth: 1, borderBottomColor: c.border, paddingBottom: CHAT_MARKDOWN_VISUAL.headingUnderlinePadding } : {}),
       ...(level === 3 && compact ? { textTransform: "uppercase", letterSpacing: 0.7 } : {}),
       ...(level < 3 && preferences.richText.heading === "c" ? { borderLeftWidth: 3, borderLeftColor: c.accent, paddingLeft: 10 } : {}),
     };
   };
   const quote = preferences.richText.quote;
   const quoteStyle: TextStyle & ViewStyle = quote === "b"
-    ? { backgroundColor: c.surface1, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 10 }
-    : { borderLeftWidth: quote === "a" ? 2 : 0, borderLeftColor: c.accent, paddingLeft: quote === "a" ? 14 : 20, paddingVertical: quote === "a" ? 2 : 0 };
+    ? { backgroundColor: c.surface1, borderRadius: CHAT_MARKDOWN_VISUAL.blockRadius, paddingHorizontal: CHAT_MARKDOWN_VISUAL.quote.cardHorizontal, paddingVertical: CHAT_MARKDOWN_VISUAL.quote.cardVertical }
+    : { borderLeftWidth: quote === "a" ? CHAT_MARKDOWN_VISUAL.quote.border : 0, borderLeftColor: c.accent, paddingLeft: quote === "a" ? CHAT_MARKDOWN_VISUAL.quote.indent : CHAT_MARKDOWN_VISUAL.quote.plainIndent, paddingVertical: quote === "a" ? 2 : 0 };
   const inline = preferences.richText.inline;
   const codeBlock = preferences.richText.code;
   const table = preferences.richText.table;
+  const codeBox: TextStyle & ViewStyle = {
+    ...mono,
+    backgroundColor: codeBlock === "c" ? "transparent" : c.surface0,
+    color: c.foreground,
+    paddingHorizontal: CHAT_MARKDOWN_VISUAL.table.horizontal,
+    paddingVertical: CHAT_MARKDOWN_VISUAL.codePaddingVertical,
+    borderRadius: CHAT_MARKDOWN_VISUAL.blockRadius,
+    borderWidth: codeBlock === "b" ? 0 : 1,
+    borderColor: c.border,
+    fontSize: typography.codeSize,
+    lineHeight: typography.codeLineHeight,
+  };
   return {
     body: { ...ui, color: c.foreground, fontSize: typography.contentSize, lineHeight: typography.proseLineHeight, flexShrink: 1, minWidth: 0, width: "100%" },
     text: { ...ui, color: c.foreground, fontSize: typography.contentSize, lineHeight: typography.proseLineHeight, flexShrink: 1, minWidth: 0 },
@@ -476,22 +492,21 @@ function createMarkdownStyles(
     s: { textDecorationLine: "line-through", color: c.foregroundMuted },
     link: { color: coreLinkColor(theme), textDecorationLine: "none", flexShrink: 1, minWidth: 0 },
     blocklink: { color: coreLinkColor(theme), textDecorationLine: "none" },
-    code_inline: { ...mono, backgroundColor: inline === "a" ? c.surface2 : "transparent", color: inline === "b" ? c.statusWarning : c.foreground, paddingHorizontal: inline === "b" ? 1 : 5, paddingVertical: inline === "b" ? 0 : 2, borderRadius: 4, borderWidth: inline === "c" ? 1 : 0, borderColor: c.border, fontSize: typography.codeSize, lineHeight: typography.codeLineHeight },
-    code_block: { ...mono, backgroundColor: codeBlock === "c" ? "transparent" : c.surface0, color: c.foreground, paddingHorizontal: 14, paddingVertical: 12, borderRadius: 8, borderWidth: codeBlock === "b" ? 0 : 1, borderColor: c.border, fontSize: typography.codeSize, lineHeight: typography.codeLineHeight },
-    fence: { ...mono, backgroundColor: codeBlock === "c" ? "transparent" : c.surface0, color: c.foreground, paddingHorizontal: 14, paddingVertical: 12, borderRadius: 8, borderWidth: codeBlock === "b" ? 0 : 1, borderColor: c.border, fontSize: typography.codeSize, lineHeight: typography.codeLineHeight },
+    code_inline: { ...mono, backgroundColor: inline === "a" ? c.surface2 : "transparent", color: inline === "b" ? c.statusWarning : c.foreground, paddingHorizontal: inline === "b" ? 1 : CHAT_MARKDOWN_VISUAL.inlinePadding.horizontal, paddingVertical: inline === "b" ? 0 : CHAT_MARKDOWN_VISUAL.inlinePadding.vertical, borderRadius: CHAT_MARKDOWN_VISUAL.inlineRadius, borderWidth: inline === "c" ? 1 : 0, borderColor: c.border, fontSize: typography.codeSize, lineHeight: typography.codeLineHeight },
+    code_block: codeBox, fence: codeBox,
     pre: { marginVertical: 0 },
-    table: { borderWidth: table === "a" || table === "d" ? 1 : 0, borderColor: c.border, borderRadius: table === "c" ? 0 : 8, marginVertical: 0 },
+    table: { borderWidth: table === "a" || table === "d" ? 1 : 0, borderColor: c.border, borderRadius: table === "c" ? 0 : CHAT_MARKDOWN_VISUAL.blockRadius, marginVertical: 0 },
     thead: { backgroundColor: table === "a" || table === "d" ? c.surface1 : "transparent" }, tbody: {},
-    th: { paddingHorizontal: table === "c" ? 0 : 14, paddingVertical: table === "c" ? 7 : 9, borderBottomWidth: table === "b" ? 0 : 1, borderColor: c.border, fontWeight: "600", color: c.foregroundMuted, fontSize: 12, textAlign: "left" },
+    th: { paddingHorizontal: table === "c" ? 0 : CHAT_MARKDOWN_VISUAL.table.horizontal, paddingVertical: table === "c" ? CHAT_MARKDOWN_VISUAL.table.compactVertical : CHAT_MARKDOWN_VISUAL.table.vertical, borderBottomWidth: table === "b" ? 0 : 1, borderColor: c.border, fontWeight: "600", color: c.foregroundMuted, fontSize: 12, textAlign: "left" },
     tr: { borderBottomWidth: table === "b" ? 0 : 1, borderColor: c.border, flexDirection: "row" },
-    td: { ...mono, paddingHorizontal: table === "c" ? 0 : 14, paddingVertical: table === "c" ? 7 : 9, borderRightWidth: table === "d" ? 1 : 0, borderColor: c.border, color: c.foreground, fontSize: typography.contentSize - 1, lineHeight: Math.round((typography.contentSize - 1) * 1.45), flex: 1 },
+    td: { ...mono, paddingHorizontal: table === "c" ? 0 : CHAT_MARKDOWN_VISUAL.table.horizontal, paddingVertical: table === "c" ? CHAT_MARKDOWN_VISUAL.table.compactVertical : CHAT_MARKDOWN_VISUAL.table.vertical, borderRightWidth: table === "d" ? 1 : 0, borderColor: c.border, color: c.foreground, fontSize: typography.contentSize - 1, lineHeight: Math.round((typography.contentSize - 1) * 1.45), flex: 1 },
     bullet_list: { paddingLeft: 0, width: "100%" }, ordered_list: { paddingLeft: 0, width: "100%" },
-    list_item: { marginBottom: preferences.density === "compact" ? 3 : preferences.density === "spacious" ? 10 : 6, flexDirection: "row", alignItems: "flex-start", flexShrink: 1 },
-    bullet_list_icon: { ...ui, color: c.foregroundMuted, marginLeft: 4, marginRight: 10, fontSize: typography.contentSize, lineHeight: typography.proseLineHeight },
-    ordered_list_icon: { ...mono, color: c.foregroundMuted, marginLeft: 4, marginRight: 10, fontSize: typography.codeSize + 1, lineHeight: typography.proseLineHeight, minWidth: 12 },
+    list_item: { marginBottom: CHAT_MARKDOWN_DENSITY[preferences.density].listGap, flexDirection: "row", alignItems: "flex-start", flexShrink: 1 },
+    bullet_list_icon: { ...ui, color: c.foregroundMuted, marginLeft: CHAT_MARKDOWN_VISUAL.listMarkerMargin.left, marginRight: CHAT_MARKDOWN_VISUAL.listMarkerMargin.right, fontSize: typography.contentSize, lineHeight: typography.proseLineHeight },
+    ordered_list_icon: { ...mono, color: c.foregroundMuted, marginLeft: CHAT_MARKDOWN_VISUAL.listMarkerMargin.left, marginRight: CHAT_MARKDOWN_VISUAL.listMarkerMargin.right, fontSize: typography.codeSize + 1, lineHeight: typography.proseLineHeight, minWidth: 12 },
     bullet_list_content: { flex: 1, flexShrink: 1 }, ordered_list_content: { flex: 1, flexShrink: 1 },
     blockquote: { ...quoteStyle, color: quote === "b" ? c.foreground : c.foregroundMuted, marginVertical: 0 },
-    hr: { backgroundColor: c.border, height: preferences.richText.rule === "b" ? 0 : 1, width: preferences.richText.rule === "c" ? 48 : "100%", marginVertical: 8 },
+    hr: { backgroundColor: c.border, height: preferences.richText.rule === "b" ? 0 : 1, width: preferences.richText.rule === "c" ? CHAT_MARKDOWN_VISUAL.ruleWidth : "100%", marginVertical: 8 },
     image: { width: "100%", minHeight: 160, marginHorizontal: -4 },
     hardbreak: { ...ui, fontSize: typography.contentSize, lineHeight: typography.proseLineHeight }, softbreak: { ...ui, fontSize: typography.contentSize, lineHeight: typography.proseLineHeight },
   };
@@ -547,40 +562,26 @@ function MarkdownRenderer({
   children,
   style,
   markdownit,
-  rules,
   theme,
   onLinkPress,
   preferences,
 }: {
   children: string;
   style: MarkdownStyleMap;
-  markdownit: any;
-  rules: RenderRules;
+  markdownit: MarkdownIt;
   theme: PluginTheme;
   onLinkPress: (url: string) => boolean;
   preferences: Prefs;
 }) {
-  const resolvedStyles = useMemo(() => {
-    const resolved: Record<string, any> = {};
-    for (const [key, value] of Object.entries(style)) resolved[key] = StyleSheet.flatten(value);
-    for (const [key, value] of Object.entries(resolved)) {
-      resolved["_VIEW_SAFE_" + key] = removeTextStyleProps(value);
-    }
-    return StyleSheet.create(resolved);
-  }, [style]);
-  const baseRules = useMemo(() => createRenderRules(theme, markdownit, preferences), [markdownit, preferences, theme]);
+  const rules = useMemo(() => createRenderRules(theme, markdownit, preferences), [markdownit, preferences, theme]);
   const renderer = useMemo(
-    () => new AstRenderer(
-      { ...baseRules, ...rules },
-      resolvedStyles,
+    () => createMarkdownAstRenderer({
+      rules,
+      styles: style,
       onLinkPress,
-      null,
-      <Text key="dotdotdot">...</Text>,
-      IMAGE_HANDLERS,
-      null,
-      false,
-    ),
-    [baseRules, onLinkPress, resolvedStyles, rules],
+      imageHandlers: IMAGE_HANDLERS,
+    }),
+    [onLinkPress, rules, style],
   );
   return renderStableMarkdown(children, renderer, markdownit);
 }
@@ -605,16 +606,6 @@ function StreamingMarkdown({
     enableStreamingMarkdown(instance);
     return instance;
   }, []);
-  const rules = useMemo<RenderRules>(() => ({
-    text: (
-      node: ASTNode, _children: ReactNode[], _parents: ASTNode[],
-      ruleStyles: MarkdownStyleMap, inheritedStyles: TextStyle = {},
-    ) => (
-      <Text key={node.key} {...MARKDOWN_ROLE("text")} style={[inheritedStyles, ruleStyles.text]}>
-        <StreamFadeText content={node.content} />
-      </Text>
-    ),
-  }), []);
   const blocks = useMemo(() => {
     let cursor = 0;
     return splitMarkdownBlocks(source).map((block) => {
@@ -628,12 +619,11 @@ function StreamingMarkdown({
     if (/^https?:\/\//i.test(url)) void openExternalUrl(url);
     return false;
   }, []);
-  return <View {...({ className: "enrm-text" } as any)}>{blocks.map(({ block, offset }, index) => (
+  return <View {...({ className: "enrm-text" } as object)}>{blocks.map(({ block, offset }, index) => (
     <View key={"block:" + offset} style={index < blocks.length - 1 ? { marginBottom: typography.blockGap } : undefined}>
       <MarkdownRenderer
         style={styles}
         markdownit={parser}
-        rules={rules}
         theme={theme}
         onLinkPress={openLink}
         preferences={preferences}
@@ -655,7 +645,7 @@ export function StreamingAssistant({ item, theme }: PluginTimelineItemProps<Stre
     <View
       style={{ paddingVertical: typography.paddingVertical }}
       testID="assistant-message"
-      {...({ dataSet: { cpStreamingAssistant: "true" } } as any)}
+      {...({ dataSet: { cpStreamingAssistant: "true" } } as object)}
     >
       <StreamWordFade text={source} enabled={preferences.motion}>
         <StreamingMarkdown source={source} theme={theme} preferences={preferences} typography={typography} />

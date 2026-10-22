@@ -341,7 +341,10 @@ export type { Phase };
 
 const IMAGE_MD = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
 
-export const imagesSchema = z.object({ images: z.array(z.object({ alt: z.string(), url: z.string() })) });
+export const imagesSchema = z.object({
+  images: z.array(z.object({ alt: z.string(), url: z.string() })),
+  phase: z.enum(["streaming", "complete"]).optional(),
+});
 
 /** Images of an assistant message that is nothing but image markdown; mixed messages stay native. */
 export function imageData(text: string) {

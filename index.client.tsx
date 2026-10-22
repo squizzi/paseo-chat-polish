@@ -3,7 +3,7 @@ import type { PluginClientContext, PluginSidebarItemProps } from "@getpaseo/plug
 import { copyText, useToast, type ToastApi } from "@getpaseo/plugin/client/react-native";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { useEffect } from "react";
-import { z } from "zod";
+import { Platform } from "react-native";
 import { Dashboard } from "./client/dashboard";
 import { clearImageCache } from "./client/images";
 import { sidebarIcon } from "./client/mark";
@@ -12,11 +12,11 @@ import { followAgent, isTodo, onStaleSteps, onUnplacedStep, placeStep, resetMade
 import { renderDiagram } from "./shared/diagram";
 import { currentPrefs, savePrefs, setPrefs, subscribePrefs, usePrefsSaver } from "./client/prefs";
 import { bindThemeRegistry, currentTheme, registerTheme } from "./client/theme-registry";
-import { addIconSet, bindPromptKeys, clampUserMessages, iconTwins, jumpToPrompt, openAgentIds, paintSidebar, redrawDiagrams, setCompactHandler, readHostAppearance, restyleNative, selectionCopyMenu, setNativeColors, setRailProviders, setRichText, smoothStreamingText, stylePluginViews, nativeIconSet, watchDom } from "./client/web";
+import { addIconSet, bindPromptKeys, clampUserMessages, iconTwins, installChatMotion, jumpToPrompt, openAgentIds, paintSidebar, redrawDiagrams, setCompactHandler, readHostAppearance, restyleNative, selectionCopyMenu, setNativeColors, setRailProviders, setRichText, stylePluginViews, nativeIconSet, watchDom } from "./client/web";
 import { getTheme, THEME_CATALOG_ID, themeSchema } from "./shared/theme";
 import { getIconSet, getPrefs, type Prefs } from "./shared/timeline";
 import { HtmlItem, ImagesItem, NoticeItem, PlanItem, RecapItem, StepsItem, ThoughtItem, TodoItem, ToolItem } from "./client/views";
-import { StreamingAssistant } from "./client/streaming-markdown";
+import { StreamingAssistant, streamingAssistantSchema } from "./client/streaming-markdown";
 import { htmlData, htmlSchema } from "./client/html";
 import { recapSchema } from "./shared/recap";
 
@@ -56,7 +56,7 @@ export default function contribute(client: PluginClientContext) {
   const unclamp = clampUserMessages(() => currentPrefs().userMessages === "clamp");
   const unselect = selectionCopyMenu(() => currentPrefs().selectionCopy === "on");
   const unicons = nativeIconSet(() => currentPrefs().iconSet);
-  const unsmoothText = smoothStreamingText(() => currentPrefs().motion, subscribePrefs);
+  const uninstallChatMotion = installChatMotion(() => currentPrefs().motion, subscribePrefs);
 
   // The composer's model selector rail lists every provider, which Paseo only renders for new chats.
   const loadProviders = () =>
@@ -111,13 +111,15 @@ export default function contribute(client: PluginClientContext) {
   // Transformers read prefs when they run; re-register when hiding or images change so Paseo re-transforms.
   const addTransformers = () => {
     const removers = [
-      client.addTimelineTransformer({
-        id: `${KIND}-streaming-assistant`,
-        query: { itemType: "assistant_message" },
-        transform: ({ item, phase }) => phase === "streaming" && currentPrefs().motion
-          ? one("streaming-assistant", { text: item.text })
-          : undefined,
-      }),
+      ...(Platform.OS === "web" ? [
+        client.addTimelineTransformer({
+          id: `${KIND}-streaming-assistant`,
+          query: { itemType: "assistant_message" },
+          transform: ({ item, phase }) => phase === "streaming" && currentPrefs().motion
+            ? one("streaming-assistant", { text: item.text })
+            : undefined,
+        }),
+      ] : []),
       client.addTimelineTransformer({
         id: `${KIND}-tool`,
         query: { itemType: "tool_call" },
@@ -143,9 +145,9 @@ export default function contribute(client: PluginClientContext) {
       client.addTimelineTransformer({
         id: `${KIND}-images`,
         query: { itemType: "assistant_message" },
-        transform: ({ item }) => {
+        transform: ({ item, phase }) => {
           const data = currentPrefs().images === "native" ? undefined : imageData(item.text);
-          return data ? one("images", data) : undefined;
+          return data ? one("images", { ...data, phase }) : undefined;
         },
       }),
       // Todo updates fold into the merged row around them (what changed comes from the followed timeline); otherwise each is one row.
@@ -253,7 +255,9 @@ export default function contribute(client: PluginClientContext) {
   client.addTimelineRenderer({ kind: `${KIND}-steps`, version: 1, schema: stepsSchema, Component: StepsItem });
   client.addTimelineRenderer({ kind: `${KIND}-recap`, version: 1, schema: recapSchema, Component: RecapItem });
   client.addTimelineRenderer({ kind: `${KIND}-html`, version: 1, schema: htmlSchema, Component: HtmlItem });
-  client.addTimelineRenderer({ kind: `${KIND}-streaming-assistant`, version: 1, schema: z.object({ text: z.string() }), Component: StreamingAssistant });
+  if (Platform.OS === "web") {
+    client.addTimelineRenderer({ kind: `${KIND}-streaming-assistant`, version: 1, schema: streamingAssistantSchema, Component: StreamingAssistant });
+  }
 
   const unbindPromptKeys = bindPromptKeys();
   for (const [id, title, direction] of [["previous-prompt", "Previous prompt", -1], ["next-prompt", "Next prompt", 1]] as const) {
@@ -323,7 +327,7 @@ export default function contribute(client: PluginClientContext) {
     unclamp();
     unselect();
     unicons();
-    unsmoothText();
+    uninstallChatMotion();
     unsubscribeProviders();
     unrestyle();
     unstylePluginViews();

@@ -9,7 +9,11 @@ function loadTypeScriptModule(path) {
   const moduleSource = readFileSync(new URL(path, import.meta.url), "utf8");
   const js = ts.transpileModule(moduleSource, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const module = { exports: {} };
-  new Function("exports", "module", js)(module.exports, module);
+  const require = (id) => {
+    if (id === "./chat-markdown-style") return loadTypeScriptModule("../client/chat-markdown-style.ts");
+    throw new Error(`Unexpected test dependency: ${id}`);
+  };
+  new Function("exports", "module", "require", js)(module.exports, module, require);
   return module.exports;
 }
 
@@ -19,6 +23,47 @@ test("streaming markdown uses Chat Polish's style contract", () => {
   assert.match(source, /testID="assistant-message"/);
   assert.match(source, /className: "enrm-text"/);
   assert.match(source, /paseoMarkdownTag/);
+});
+
+test("streaming assistant replacement stays web-only and shares its renderer schema", () => {
+  const entry = readFileSync(new URL("../index.client.tsx", import.meta.url), "utf8");
+
+  assert.match(entry, /Platform\.OS === "web" \? \[/);
+  assert.match(entry, /schema: streamingAssistantSchema/);
+  assert.doesNotMatch(entry, /schema: z\.object\(\{ text:/);
+});
+
+test("private Markdown renderer imports stay behind one typed adapter", () => {
+  const adapter = readFileSync(new URL("../client/markdown-renderer-adapter.ts", import.meta.url), "utf8");
+  const parser = readFileSync(new URL("../client/streaming-markdown-parser.ts", import.meta.url), "utf8");
+
+  assert.match(adapter, /react-native-markdown-display\/src\/lib\/AstRenderer/);
+  assert.match(source, /createMarkdownAstRenderer/);
+  assert.doesNotMatch(source, /react-native-markdown-display\/src\/lib/);
+  assert.doesNotMatch(parser, /\bany\b/);
+  assert.doesNotMatch(adapter, /\bany\b/);
+});
+
+test("only newly streamed inline images animate when loading completes", () => {
+  const image = source.slice(
+    source.indexOf("function StreamingMarkdownImage"),
+    source.indexOf("const LANGUAGE_ALIASES"),
+  );
+
+  assert.match(source, /fade\.source\.lastIndexOf\(source\)/);
+  assert.match(image, /const \[animateArrival\] = useState\(\(\) => isNewStreamImage\(fade, source\)\)/);
+  assert.match(image, /status === "loaded" && animateArrival \? IMAGE_ARRIVAL_PROPS/);
+  assert.match(image, /onLoad=\{\(\) => setLoadState\(\{ source, status: "loaded" \}\)\}/);
+});
+
+test("image-only rows carry live phase into one-shot arrival identity", () => {
+  const entry = readFileSync(new URL("../index.client.tsx", import.meta.url), "utf8");
+  const views = readFileSync(new URL("../client/views.tsx", import.meta.url), "utf8");
+
+  assert.match(entry, /transform: \(\{ item, phase \}\)/);
+  assert.match(entry, /one\("images", \{ \.\.\.data, phase \}\)/);
+  assert.match(views, /imageArrivals\.claim\(arrivalKey, live && prefs\.motion\)/);
+  assert.match(views, /timestamp\.getTime\(\)/);
 });
 
 test("thinking panels apply the shared tail fade to paced streaming text", () => {
@@ -31,6 +76,12 @@ test("thinking panels apply the shared tail fade to paced streaming text", () =>
   assert.match(thought, /StreamWordFade/);
   assert.match(thought, /enabled=\{motion && streaming\}/);
   assert.match(thought, /<StreamFadeText content=\{para\}/);
+});
+
+test("timeline renderers do not call the declaration-only revealed-text hook", () => {
+  const views = readFileSync(new URL("../client/views.tsx", import.meta.url), "utf8");
+
+  assert.doesNotMatch(views, /\buseRevealedText\b/);
 });
 
 test("completed merged tool runs expose their logical summary arrival", () => {
@@ -68,11 +119,48 @@ test("the shared contract follows host typography and Chat Polish density", () =
   });
 });
 
+test("completed and streaming Markdown share visual metrics", () => {
+  const contract = readFileSync(new URL("../client/chat-markdown-style.ts", import.meta.url), "utf8");
+  const web = readFileSync(new URL("../client/web.ts", import.meta.url), "utf8");
+  const views = readFileSync(new URL("../client/views.tsx", import.meta.url), "utf8");
+
+  assert.match(contract, /CHAT_MARKDOWN_VISUAL/);
+  assert.match(contract, /CHAT_IMAGE_FRAMES/);
+  assert.match(contract, /CHAT_ROW_TIGHT/);
+  assert.match(contract, /CHAT_ROW_QUIET/);
+  assert.match(source, /CHAT_MARKDOWN_VISUAL/);
+  assert.match(web, /CHAT_MARKDOWN_VISUAL/);
+  assert.match(web, /CHAT_IMAGE_FRAMES/);
+  assert.match(web, /CHAT_ROW_TIGHT/);
+  assert.match(web, /CHAT_ROW_QUIET/);
+  assert.match(views, /CHAT_IMAGE_FRAMES/);
+  assert.match(views, /CHAT_ROW_TIGHT/);
+  assert.match(views, /CHAT_ROW_QUIET/);
+  assert.doesNotMatch(web, /const hexAlpha =/);
+  assert.doesNotMatch(web, /const darker =/);
+  assert.doesNotMatch(views, /const TIGHT = /);
+  assert.doesNotMatch(views, /const QUIET = /);
+});
+
+test("sunken surfaces and hex alpha live in one module", () => {
+  const { alpha, sunken } = loadTypeScriptModule("../client/color.ts");
+
+  assert.equal(sunken("#23272e"), "#1e2228");
+  assert.equal(alpha("#23272e", 0.6), "#23272e99");
+  assert.equal(alpha("#abc", 1), "#aabbccff");
+  assert.equal(sunken("rgb(35, 39, 46)"), "rgb(35, 39, 46)");
+});
+
 test("streaming image placeholders start at their configured thumbnail size", () => {
-  const { streamingImageFrameSize } = loadTypeScriptModule("../client/streaming-image-layout.ts");
+  const { createImageArrivalRegistry, streamingImageFrameSize } = loadTypeScriptModule("../client/streaming-image-layout.ts");
 
   assert.deepEqual(streamingImageFrameSize("web", "small"), { width: 200, height: 128, minHeight: 128 });
   assert.deepEqual(streamingImageFrameSize("web", "large"), { width: 320, height: 200, minHeight: 200 });
   assert.equal(streamingImageFrameSize("web", "native"), undefined);
   assert.equal(streamingImageFrameSize("ios", "small"), undefined);
+
+  const arrivals = createImageArrivalRegistry();
+  assert.equal(arrivals.claim("agent:turn:image", true), true);
+  assert.equal(arrivals.claim("agent:turn:image", true), false, "a tab remount must not replay the same image arrival");
+  assert.equal(arrivals.claim("agent:history:image", false), false, "rehydrated images start settled");
 });

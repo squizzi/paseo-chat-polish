@@ -1,6 +1,6 @@
 import type { PluginTheme } from "@getpaseo/plugin";
 import { openExternalUrl, useAgent, useRpc, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { copyText, ScrollView, useRevealedText, useToast } from "@getpaseo/plugin/client/react-native";
+import { copyText, ScrollView, useToast } from "@getpaseo/plugin/client/react-native";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { AccessibilityInfo, Animated, Easing, Image, LayoutAnimation, Modal, Platform, Pressable, StyleSheet, Text, useWindowDimensions, View, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
@@ -23,17 +23,29 @@ import { HtmlFrame, lastFrameHeight, useHovered, useHtmlTheme, windowButtonsInse
 import { htmlPage } from "../shared/page";
 import { inlineImages, localImages, openHtml } from "../shared/html";
 import { StreamFadeText, StreamWordFade } from "./streaming-markdown";
+import {
+  CHAT_IMAGE_FRAMES,
+  CHAT_MARKDOWN_CODE_LINE_HEIGHT,
+  CHAT_MARKDOWN_LINE_HEIGHT,
+  CHAT_MARKDOWN_VISUAL,
+  CHAT_MONO_FALLBACK,
+  CHAT_ROW_QUIET,
+  CHAT_ROW_TIGHT,
+} from "./chat-markdown-style";
+import { alpha, sunken } from "./color";
+import { createImageArrivalRegistry, IMAGE_ARRIVAL_PROPS } from "./streaming-image-layout";
 
 type Colors = PluginTheme["colors"];
 const SQUIRCLE_CARD = { dataSet: { cpSquircle: "card" } } as object;
 const ROW_HOVER = { dataSet: { cpRow: "" } } as object;
 const RUNNING_LABEL = { dataSet: { cpRunningLabel: "" } } as object;
 const RUN_SUMMARY = { dataSet: { cpRunSummary: "" } } as object;
+const TOOL_SUMMARY = { dataSet: { cpToolSummary: "" } } as object;
 const NO_WRAP_SCROLL = { dataSet: { cpNowrap: "" } } as object;
-const IMAGE_ARRIVAL = { dataSet: { cpImageArrival: "" } } as object;
+const imageArrivals = createImageArrivalRegistry();
 
 // Paseo's own fallback stack when Settings → Appearance → Code font is empty.
-const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" });
+const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: CHAT_MONO_FALLBACK });
 const ICON_SLOT = 20;
 
 /**
@@ -44,11 +56,7 @@ export const PMONO = { dataSet: { pmono: "" } } as object;
 const INDENT = 28;
 // Paseo puts 16pt between timeline items; rows are 26pt tall, so 6pt less gives the design's 36pt pitch (normal density). The split puts a row
 // 20pt from reply text on both sides, with the tighter reply blocks in web.ts (6pt item gap, 4pt padding).
-// Compact and spacious move rows 6pt closer or 8pt further apart; web.ts sets the same values for Paseo's rows.
-const TIGHT = { compact: { marginTop: 0, marginBottom: -12 }, normal: { marginTop: 2, marginBottom: -8 }, spacious: { marginTop: 5, marginBottom: -3 } };
-/** How far faded thought and tool rows step back, per strength (Paseo's own rows match it in web.ts). */
-const QUIET = { dim: 0.3, faded: 0.45, soft: 0.65, full: 1 };
-
+// Compact and spacious move rows 6pt closer or 8pt further apart; CHAT_ROW_TIGHT is also the CSS for Paseo's rows.
 function toneColor(c: Colors, tone: Tone | undefined) {
   if (tone === "success") return c.statusSuccess;
   if (tone === "danger") return c.statusDanger;
@@ -57,28 +65,12 @@ function toneColor(c: Colors, tone: Tone | undefined) {
   return c.foregroundMuted;
 }
 
-/** Hex color with alpha; non-hex colors (rgb(), names) are returned unchanged. */
-export function alpha(color: string, a: number) {
-  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color);
-  if (!m) return color;
-  const hex = m[1]!.length === 3 ? [...m[1]!].map((ch) => ch + ch).join("") : m[1]!;
-  return `#${hex}${Math.round(a * 255).toString(16).padStart(2, "0")}`;
-}
-
-/** The sunken surface behind code blocks: a step darker than the canvas (#23272e → #1e2227 in Mariana). */
-export function sunken(color: string) {
-  const m = /^#([0-9a-f]{6})$/i.exec(color);
-  if (!m) return color;
-  const n = parseInt(m[1]!, 16);
-  return `#${[16, 8, 0].map((sh) => Math.round(((n >> sh) & 255) * 0.86).toString(16).padStart(2, "0")).join("")}`;
-}
-
 /** Sizes follow Settings → Appearance: content size for prose and rows, code size (line height 1.5×) for code. */
 function makeStyles(c: Colors, a: HostAppearance) {
   const ui = a.uiFont ? { fontFamily: a.uiFont } : {};
   const mono = { fontFamily: a.monoFont ? `${a.monoFont}, ${MONO}` : MONO };
   const body = a.contentSize - 1;
-  const code = { ...mono, fontSize: a.codeSize, lineHeight: Math.round(a.codeSize * 1.5) };
+  const code = { ...mono, fontSize: a.codeSize, lineHeight: Math.round(a.codeSize * CHAT_MARKDOWN_CODE_LINE_HEIGHT) };
   const rule = alpha(c.border, 0.6);
   return StyleSheet.create({
     row: { flexDirection: "row", alignItems: "center", gap: 8, minHeight: 26, paddingVertical: 3 },
@@ -89,14 +81,14 @@ function makeStyles(c: Colors, a: HostAppearance) {
     meta: { ...ui, color: c.foregroundMuted, fontSize: body - 2, fontVariant: ["tabular-nums"], marginLeft: "auto", flexShrink: 0 },
     detail: { paddingLeft: INDENT, paddingTop: 2, marginTop: 6 },
     ruled: { paddingLeft: 18, borderLeftWidth: 1, borderLeftColor: c.border, gap: 4, paddingVertical: 2 },
-    block: { borderRadius: 8, backgroundColor: sunken(c.surface0), borderWidth: 1, borderColor: rule, overflow: "hidden" },
+    block: { borderRadius: CHAT_MARKDOWN_VISUAL.blockRadius, backgroundColor: sunken(c.surface0), borderWidth: 1, borderColor: rule, overflow: "hidden" },
     blockHead: { flexDirection: "row", alignItems: "baseline", gap: 8, paddingHorizontal: 12, paddingVertical: 9, borderBottomWidth: 1, borderBottomColor: rule },
     blockBody: { paddingHorizontal: 12, paddingVertical: 9 },
     code: { ...code, color: c.foreground },
     gutter: { ...code, color: c.foregroundMuted, opacity: 0.6, textAlign: "right", fontVariant: ["tabular-nums"], flexShrink: 0 },
     small: { ...ui, color: c.foregroundMuted, fontSize: body - 1, lineHeight: Math.round((body - 1) * 1.45) },
     label: { ...ui, color: c.foregroundMuted, fontSize: 10, fontWeight: "600", letterSpacing: 0.8, marginBottom: 4 },
-    prose: { ...ui, color: c.foregroundMuted, fontSize: body, lineHeight: Math.round(body * 1.6) },
+    prose: { ...ui, color: c.foregroundMuted, fontSize: body, lineHeight: Math.round(body * CHAT_MARKDOWN_LINE_HEIGHT) },
     card: { borderRadius: 12, backgroundColor: c.surface1, borderWidth: 1, borderColor: rule, overflow: "hidden" },
     cardHead: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: rule },
     title: { ...ui, color: c.foreground, fontSize: body, fontWeight: "600" },
@@ -339,7 +331,7 @@ function Row(p: RowProps) {
       accessibilityRole={p.onToggle ? "button" : undefined}
       accessibilityState={p.onToggle ? { expanded: !!p.open } : undefined}
       // Bleeds into the gutter so the hover surface (full-strength rows only; faded rows brighten instead) covers the same area as Paseo's own tool rows.
-      style={[s.row, { marginHorizontal: -13, paddingHorizontal: 13, borderRadius: 6 }, hovered && p.onToggle && steps === "full" ? { backgroundColor: c.surface1 } : null, quiet && { opacity: QUIET[steps] }]}
+      style={[s.row, { marginHorizontal: -13, paddingHorizontal: 13, borderRadius: 6 }, hovered && p.onToggle && steps === "full" ? { backgroundColor: c.surface1 } : null, quiet && { opacity: CHAT_ROW_QUIET[steps] }]}
     >
       {bare ? null : (
         <View style={s.slot}>
@@ -539,7 +531,7 @@ export function ToolItem({ item, theme, layout, nested, agentId }: PluginTimelin
   const indent = useIndent("tool");
   const c = theme.colors;
   return (
-    <Animated.View style={[nested ? null : TIGHT[density], enter, d.status === "canceled" ? { opacity: 0.55 } : null]}>
+    <Animated.View {...(!nested ? TOOL_SUMMARY : {})} style={[nested ? null : CHAT_ROW_TIGHT[density], enter, d.status === "canceled" ? { opacity: 0.55 } : null]}>
       <Row
         theme={theme}
         compact={layout.compact}
@@ -620,7 +612,7 @@ export function MergedSteps(
   const c = theme.colors;
   const failed = steps.filter((s) => s.item.type === "tool_call" && s.item.status === "failed").length;
   return (
-    <View {...(!live ? RUN_SUMMARY : {})} style={TIGHT[density]}>
+    <View {...TOOL_SUMMARY} {...(!live ? RUN_SUMMARY : {})} style={CHAT_ROW_TIGHT[density]}>
       <Row
         theme={theme}
         compact={layout.compact}
@@ -650,10 +642,10 @@ export function ThoughtItem({ item, theme, layout, nested }: PluginTimelineItemP
   const [open, toggle] = useDisclosure(reasoning === "paseo" ? readHostAppearance().autoExpandReasoning : reasoning === "expanded");
   const streaming = item.data.phase === "streaming";
   const enter = useEnter(streaming);
-  const text = useRevealedText(item.data.text, item.data.phase);
+  const text = item.data.text;
   const inset = useIndent("thought") ? 9 : 0;
   return (
-    <Animated.View style={[nested ? null : TIGHT[density], enter]}>
+    <Animated.View style={[nested ? null : CHAT_ROW_TIGHT[density], enter]}>
       <Row
         theme={theme}
         compact={layout.compact}
@@ -687,7 +679,7 @@ export function ThoughtItem({ item, theme, layout, nested }: PluginTimelineItemP
 export function PlanItem({ item, theme }: PluginTimelineItemProps<z.output<typeof planSchema>>) {
   const s = useStyles(theme);
   const [open, toggle] = useDisclosure();
-  const text = useRevealedText(item.data.text, item.data.phase).trim();
+  const text = item.data.text.trim();
   const long = text.split("\n").length > 14 || text.length > 1200;
   const steps = text.match(/^\s*\d+[.)]\s/gm)?.length ?? 0;
   return (
@@ -730,11 +722,9 @@ function TaskChangeRow({ theme, layout, step, change }: PluginTimelineItemProps<
   return (
     <View>
       <Row theme={theme} compact={layout.compact} kind="tool" icon="ListChecks" verb={verb} target={target} meta={`${done}/${items.length}`} open={open} onToggle={toggle} />
-      {open ? (
-        <FadeIn style={{ paddingLeft: indent, paddingTop: 2, paddingBottom: 8 }}>
-          <TodoList theme={theme} items={items} />
-        </FadeIn>
-      ) : null}
+      <Expand open={open} style={{ paddingLeft: indent, paddingTop: 2, paddingBottom: 8 }}>
+        <TodoList theme={theme} items={items} />
+      </Expand>
     </View>
   );
 }
@@ -811,11 +801,9 @@ export function TodoItem({ item, theme }: PluginTimelineItemProps<z.output<typeo
           <Icon name="ChevronRight" size={12} color={c.foregroundMuted} />
         </Animated.View>
       </Pressable>
-      {open ? (
-        <FadeIn style={{ paddingLeft: INDENT, paddingTop: 2, paddingBottom: 6 }}>
-          <TodoList theme={theme} items={items} />
-        </FadeIn>
-      ) : null}
+      <Expand open={open} style={{ paddingLeft: INDENT, paddingTop: 2, paddingBottom: 6 }}>
+        <TodoList theme={theme} items={items} />
+      </Expand>
     </View>
   );
 }
@@ -866,15 +854,14 @@ function useImage(url: string, variant: "thumbnail" | "original" = "original") {
   return state.key === key ? state : {};
 }
 
-const THUMB = { small: { width: 200, height: 128 }, large: { width: 320, height: 200 } };
-
-function Thumbnail({ alt, url, theme, onOpen }: { alt: string; url: string; theme: PluginTheme; onOpen(): void }) {
+function Thumbnail({ alt, url, theme, arrivalKey, live, onOpen }: { alt: string; url: string; theme: PluginTheme; arrivalKey: string; live: boolean; onOpen(): void }) {
   const s = useStyles(theme);
   const c = theme.colors;
   const { uri, failed } = useImage(url, "thumbnail");
   const prefs = usePrefs();
-  const size = THUMB[prefs.images === "large" ? "large" : "small"];
-  const frame = [size, { borderRadius: 8, borderWidth: StyleSheet.hairlineWidth, borderColor: c.border, backgroundColor: c.surface1, overflow: "hidden" as const }];
+  const [animateArrival] = useState(() => imageArrivals.claim(arrivalKey, live && prefs.motion));
+  const size = CHAT_IMAGE_FRAMES[prefs.images === "large" ? "large" : "small"];
+  const frame = [size, { borderRadius: CHAT_MARKDOWN_VISUAL.blockRadius, borderWidth: StyleSheet.hairlineWidth, borderColor: c.border, backgroundColor: c.surface1, overflow: "hidden" as const }];
   if (!uri) {
     return (
       <View style={[frame, { alignItems: "center", justifyContent: "center", gap: 6 }]}>
@@ -884,7 +871,7 @@ function Thumbnail({ alt, url, theme, onOpen }: { alt: string; url: string; them
     );
   }
   return (
-    <Pressable {...(prefs.motion ? IMAGE_ARRIVAL : {})} accessibilityRole="imagebutton" accessibilityLabel={`Open ${alt}`} onPress={onOpen} style={frame}>
+    <Pressable {...(animateArrival ? IMAGE_ARRIVAL_PROPS : {})} accessibilityRole="imagebutton" accessibilityLabel={`Open ${alt}`} onPress={onOpen} style={frame}>
       <Image source={{ uri }} style={size} resizeMode="cover" />
     </Pressable>
   );
@@ -998,13 +985,14 @@ function Lightbox({ images, index, onIndex, onClose }: { images: Array<{ alt: st
   );
 }
 
-export function ImagesItem({ item, theme }: PluginTimelineItemProps<z.output<typeof imagesSchema>>) {
+export function ImagesItem({ item, theme, agentId, timestamp }: PluginTimelineItemProps<z.output<typeof imagesSchema>>) {
   const [open, setOpen] = useState<number>();
+  const live = item.data.phase === "streaming";
   return (
     // Rows leave 8pt less below and take 2pt more above (TIGHT), so thumbnails between two rows sit 19pt from each.
     <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 11, paddingBottom: 1 }}>
       {item.data.images.map((img, i) => (
-        <Thumbnail key={i} alt={img.alt} url={img.url} theme={theme} onOpen={() => setOpen(i)} />
+        <Thumbnail key={`${i}:${img.url}`} alt={img.alt} url={img.url} theme={theme} arrivalKey={`${agentId}:${timestamp.getTime()}:${i}:${img.url}`} live={live} onOpen={() => setOpen(i)} />
       ))}
       {open !== undefined ? <Lightbox images={item.data.images} index={open} onIndex={setOpen} onClose={() => setOpen(undefined)} /> : null}
     </View>
