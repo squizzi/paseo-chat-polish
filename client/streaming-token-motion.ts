@@ -1,5 +1,5 @@
 export const STREAM_TOKEN_PREROLL_MS = 36;
-export const STREAM_TOKEN_FADE_MS = 400;
+export const STREAM_TOKEN_FADE_MS = 320;
 export const STREAM_FADE_DURATION_MS = STREAM_TOKEN_PREROLL_MS + STREAM_TOKEN_FADE_MS;
 
 export interface StreamFadeChunk {
@@ -28,11 +28,11 @@ export function nextFadeState(
   if (visible === text) return state;
   if (!text.startsWith(visible)) return { committed: text, chunks: [] };
   return {
-    // A new append makes the previous batch part of the settled stream. Keeping
-    // several fade windows alive at once blurs text above the live edge and is
-    // especially distracting when Markdown reparses that text into new nodes.
-    committed: visible,
-    chunks: [{ start: visible.length, text: text.slice(visible.length), startedAtMs: now }],
+    // Keep recent arrivals in their own reveal windows. Their overlapping
+    // opacity envelopes form one continuously advancing tail instead of
+    // snapping the preceding word to full opacity whenever the next arrives.
+    committed: state.committed,
+    chunks: [...state.chunks, { start: visible.length, text: text.slice(visible.length), startedAtMs: now }],
   };
 }
 

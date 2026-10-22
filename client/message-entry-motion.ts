@@ -4,6 +4,8 @@ export interface MessageEntryContext {
   running: boolean;
   isUserMessage: boolean;
   suppressHydrationMotion: boolean;
+  /** This mutation is part of history restoration, rather than a later live row. */
+  isHydrating: boolean;
   isNew: boolean;
   allow: boolean;
   atBottom: boolean;
@@ -16,7 +18,9 @@ export function shouldQueueMessageEntrance(context: MessageEntryContext): boolea
   const liveTurn = context.running || context.wasRunning || context.isUserMessage;
   return context.hasPreviousChatState
     && liveTurn
-    && !context.suppressHydrationMotion
+    // Keep restored history still, but do not let its short quiet window eat
+    // a new prompt sent immediately after opening a stale tab.
+    && (!context.suppressHydrationMotion || (context.isUserMessage && !context.isHydrating))
     && context.isNew
     && context.allow
     && context.atBottom;

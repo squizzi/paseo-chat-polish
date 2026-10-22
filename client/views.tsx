@@ -22,11 +22,13 @@ import type { HtmlData } from "./html";
 import { HtmlFrame, lastFrameHeight, useHovered, useHtmlTheme, windowButtonsInset } from "./html-frame";
 import { htmlPage } from "../shared/page";
 import { inlineImages, localImages, openHtml } from "../shared/html";
+import { StreamFadeText, StreamWordFade } from "./streaming-markdown";
 
 type Colors = PluginTheme["colors"];
 const SQUIRCLE_CARD = { dataSet: { cpSquircle: "card" } } as object;
 const ROW_HOVER = { dataSet: { cpRow: "" } } as object;
 const RUNNING_LABEL = { dataSet: { cpRunningLabel: "" } } as object;
+const RUN_SUMMARY = { dataSet: { cpRunSummary: "" } } as object;
 const NO_WRAP_SCROLL = { dataSet: { cpNowrap: "" } } as object;
 const IMAGE_ARRIVAL = { dataSet: { cpImageArrival: "" } } as object;
 
@@ -619,7 +621,7 @@ export function MergedSteps(
   const c = theme.colors;
   const failed = steps.filter((s) => s.item.type === "tool_call" && s.item.status === "failed").length;
   return (
-    <View style={TIGHT[density]}>
+    <View {...(!live ? RUN_SUMMARY : {})} style={TIGHT[density]}>
       <Row
         theme={theme}
         compact={layout.compact}
@@ -645,7 +647,7 @@ export function MergedSteps(
 export function ThoughtItem({ item, theme, layout, nested }: PluginTimelineItemProps<z.output<typeof thoughtSchema>> & Nestable) {
   const s = useStyles(theme);
   // "paseo" follows Settings → Appearance → Always expand reasoning, which is off (collapsed) by default.
-  const { reasoning, density } = usePrefs();
+  const { reasoning, density, motion } = usePrefs();
   const [open, toggle] = useDisclosure(reasoning === "paseo" ? readHostAppearance().autoExpandReasoning : reasoning === "expanded");
   const streaming = item.data.phase === "streaming";
   const enter = useEnter(streaming);
@@ -664,18 +666,20 @@ export function ThoughtItem({ item, theme, layout, nested }: PluginTimelineItemP
         onToggle={text.trim() ? toggle : undefined}
       />
       {open ? (
-        <FadeIn style={[s.detail, { paddingLeft: inset, paddingTop: 0 }]}>
-          <View style={[s.ruled, { gap: 10 }]}>
-            {text
-              .trim()
-              .split(/\n\s*\n/)
-              .map((para, i) => (
-                <Text key={i} style={s.prose} selectable>
-                  {para}
-                </Text>
-              ))}
-          </View>
-        </FadeIn>
+        <StreamWordFade text={text} enabled={motion && streaming}>
+          <FadeIn style={[s.detail, { paddingLeft: inset, paddingTop: 0 }]}>
+            <View style={[s.ruled, { gap: 10 }]}>
+              {text
+                .trim()
+                .split(/\n\s*\n/)
+                .map((para, i) => (
+                  <Text key={i} style={s.prose} selectable>
+                    <StreamFadeText content={para} />
+                  </Text>
+                ))}
+            </View>
+          </FadeIn>
+        </StreamWordFade>
       ) : null}
     </Animated.View>
   );
@@ -1056,7 +1060,7 @@ export function RecapItem({ item, theme }: PluginTimelineItemProps<Recap>) {
       </View>,
     );
   return (
-    <View style={{ marginVertical: -3 }}>
+    <View {...({ dataSet: { cpTurnRecap: "" } } as object)} style={{ marginVertical: -3 }}>
       <Pressable
         onPress={toggle}
         onHoverIn={() => setHovered(true)}

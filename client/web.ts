@@ -304,7 +304,7 @@ export function watchDom(watcher: DomWatcher, cleanup: () => void) {
       if (removed.length) for (const w of watchers) w.removed?.(removed);
       settleTimer ??= setTimeout(settle, 250);
     });
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-expanded", "data-state", "data-reveal-length"] });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-expanded", "data-state", "data-reveal-length", "data-cp-run-summary"] });
   }
   watcher.added?.([document.body as DomElement]);
   watcher.settled?.([]);
@@ -327,6 +327,9 @@ const CHAT_TIMELINE = '[data-testid="agent-chat-timeline"]';
 const HISTORY_ROW = "[data-history-row-id]";
 const WORKING = '[data-testid="turn-working-indicator"]';
 const REPLY = '[data-testid="assistant-message"]';
+const TURN_RECAP = "[data-cp-turn-recap]";
+const RUN_SUMMARY = "[data-cp-run-summary]";
+const MESSAGE_ENTRY_MOTION = "data-cp-message-entry-motion";
 const chatDisclosureQuietUntil = new WeakMap<DomElement, number>();
 const cancelChatRise = new WeakMap<DomElement, () => void>();
 
@@ -339,14 +342,16 @@ interface ContentRise {
 
 interface ChatMotionState {
   seen: Set<string>;
+  seenRecapRows: Set<string>;
+  seenRunSummaryRows: Set<string>;
   pending: Set<string>;
   pendingTools: Set<string>;
+  pendingRunSummaries: Set<string>;
   running: boolean;
   scrollTop: number;
   compensatedScrollTop: number;
   maxScrollTop: number;
   clientWidth: number;
-  entryQuietUntil: number;
   toolLeadUntil: number;
   hydrationQuietUntil: number;
   reflowQuietUntil: number;
@@ -391,9 +396,11 @@ function contentRise(element: DomElement): ContentRise {
     stopAnimations();
     if (Math.abs(next) <= 0.5) return restoreOverflow();
     // Transforming the scroll-height owner expands its scrollable overflow,
-    // causing the host's bottom follow to move twice. Animate its inner layers
-    // inside a clipped, layout-stable surface instead.
-    const targets = layered ? Array.from(element.children) : [element];
+    // causing the host's bottom follow to move twice. Animate only the timeline
+    // inside a clipped, layout-stable surface. The Working/Worked footer is a
+    // sibling and must remain locked at the bottom of the laid-out content.
+    const timeline = layered ? element.querySelector(CHAT_TIMELINE) : null;
+    const targets = layered ? (timeline ? [timeline] : []) : [element];
     if (!targets.length || targets.some((target) => !target.animate)) return restoreOverflow();
     if (layered) element.style.setProperty("overflow", "clip");
     offset = next;
@@ -465,7 +472,7 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
     };
     for (const record of records) {
       const target = elementOf(record.target);
-      if (record.attributeName === "style" && target?.hasAttribute("data-cp-stream-rise")) continue;
+      if (record.attributeName === "style" && (target?.hasAttribute("data-cp-stream-rise") || target?.hasAttribute(MESSAGE_ENTRY_MOTION))) continue;
       add(record.target, false);
       for (const node of Array.from(record.addedNodes)) add(node, true);
     }
@@ -498,15 +505,19 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
     const originalOrigin = row.style.getPropertyValue("transform-origin");
     // A bubble should appear to inflate from its lower-right edge, then settle
     // into place with a nearly imperceptible one-and-a-half-pixel rebound.
+    // The origin write and cleanup are animation bookkeeping, not new layout.
+    // Mark them so the DOM observer does not replay the bubble's height delta.
+    row.setAttribute(MESSAGE_ENTRY_MOTION, "");
     row.style.setProperty("transform-origin", "100% 100%");
     const animation = row.animate([
       { offset: 0, opacity: 0, transform: "translateY(6px) scale(.96)" },
       { offset: 0.76, opacity: 1, transform: "translateY(-1.5px) scale(1.002)" },
       { opacity: 1, transform: "translateY(0) scale(1)" },
-    ], { duration: 320, easing: "cubic-bezier(0.22, 1, 0.36, 1)", fill: "both" });
+    ], { duration: 400, easing: "cubic-bezier(0.22, 1, 0.36, 1)", fill: "both" });
     const resetOrigin = () => {
       if (originalOrigin) row.style.setProperty("transform-origin", originalOrigin);
       else row.style.removeProperty("transform-origin");
+      row.removeAttribute(MESSAGE_ENTRY_MOTION);
     };
     entryAnimations.set(animation, resetOrigin);
     const finishEntry = () => {
@@ -518,13 +529,16 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
     };
     void animation.finished.then(finishEntry, finishEntry);
   };
-  const animateToolSummary = (tool: DomElement) => {
-    const button = tool.querySelector("button");
-    const line = tool.querySelector('[data-cp-part="row-label"]')
-      ?? tool.querySelector("button > div > div:nth-child(2)")
-      ?? button;
+  const animateSummary = (summary: DomElement) => {
+    const recap = summary.matches(TURN_RECAP);
+    const button = summary.querySelector("button");
+    const line = recap
+      ? summary
+      : summary.querySelector('[data-cp-part="row-label"]')
+        ?? summary.querySelector("button > div > div:nth-child(2)")
+        ?? button;
     if (reduced.matches || !line?.animate) return;
-    const clipOwner = line === button ? tool : button;
+    const clipOwner = recap || line === button ? summary : button;
     const originalOverflow = clipOwner?.style.getPropertyValue("overflow") ?? "";
     if (clipOwner) clipOwner.style.setProperty("overflow", "clip");
     // Match the plugin row's state transition: its words arrive with a small
@@ -557,8 +571,11 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
     const maxScrollTop = Math.max(0, chat.scrollHeight - chat.clientHeight);
     const atBottom = maxScrollTop - chat.scrollTop < 180;
     const seen = old?.seen ?? new Set<string>();
+    const seenRecapRows = old?.seenRecapRows ?? new Set<string>();
+    const seenRunSummaryRows = old?.seenRunSummaryRows ?? new Set<string>();
     const pending = animate && !hydrationBoundary ? old?.pending ?? new Set<string>() : new Set<string>();
     const pendingTools = animate && !hydrationBoundary ? old?.pendingTools ?? new Set<string>() : new Set<string>();
+    const pendingRunSummaries = animate && !hydrationBoundary ? old?.pendingRunSummaries ?? new Set<string>() : new Set<string>();
     const firstHistoryPopulation = Boolean(old && old.seen.size === 0 && rows.length > 0);
     const hydrationQuietUntil = hydrationBoundary || firstHistoryPopulation ? Date.now() + 500 : old?.hydrationQuietUntil ?? 0;
     const suppressHydrationMotion = Date.now() < hydrationQuietUntil;
@@ -576,6 +593,15 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
       const isNew = !seen.has(id);
       const isUserMessage = Boolean(row.querySelector('[data-testid="user-message"]'));
       const toolSummary = row.querySelector(ROW);
+      const recapSummary = row.querySelector(TURN_RECAP);
+      const runSummary = row.querySelector(RUN_SUMMARY);
+      const summary = toolSummary ?? recapSummary;
+      const recapIsNew = Boolean(recapSummary && !seenRecapRows.has(id));
+      const runSummaryIsNew = Boolean(runSummary && !seenRunSummaryRows.has(id));
+      if (recapSummary) seenRecapRows.add(id);
+      if (runSummary) seenRunSummaryRows.add(id);
+      const isHydrating = hydrationBoundary || firstHistoryPopulation;
+      const canEnterDuringHydration = isUserMessage && !isHydrating;
       seen.add(id);
       // The scale/translation bubble entrance belongs only to sent messages.
       // Assistant text reveals token-by-token; native tool summaries receive
@@ -586,50 +612,70 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
         running,
         isUserMessage,
         suppressHydrationMotion,
+        isHydrating,
         isNew,
         allow: animate,
         atBottom,
       })) pending.add(id);
-      if (toolSummary && shouldQueueMessageEntrance({
-        hasPreviousChatState: Boolean(old),
-        wasRunning: Boolean(old?.running),
-        running,
-        isUserMessage: false,
-        suppressHydrationMotion,
-        isNew,
-        allow: animate,
-        atBottom,
-      })) pendingTools.add(id);
+      const queueSummary = recapSummary
+        // Paseo appends a recap inside the existing turn row, after the reply
+        // has streamed. Track that logical child independently from the outer
+        // history row so it enters as new content without replaying on remount.
+        ? Boolean(old && recapIsNew && animate && atBottom && !isHydrating && !suppressHydrationMotion)
+        : shouldQueueMessageEntrance({
+          hasPreviousChatState: Boolean(old),
+          wasRunning: Boolean(old?.running),
+          running,
+          isUserMessage: false,
+          suppressHydrationMotion,
+          isHydrating,
+          isNew,
+          allow: animate,
+          atBottom,
+        });
+      if (summary && queueSummary) pendingTools.add(id);
+      if (runSummary && old && runSummaryIsNew && animate && atBottom && !isHydrating && !suppressHydrationMotion) pendingRunSummaries.add(id);
       const box = row.getBoundingClientRect();
       if (pending.has(id) && box.width > 0 && box.height > 0) {
         pending.delete(id);
-        if (animate && atBottom && !suppressHydrationMotion && entered++ < 12) animateEntry(row);
+        if (animate && atBottom && (!suppressHydrationMotion || canEnterDuringHydration) && entered++ < 12) animateEntry(row);
       }
       if (pendingTools.has(id) && box.width > 0 && box.height > 0) {
         pendingTools.delete(id);
-        if (animate && atBottom && !suppressHydrationMotion && !suppressWidthReflowMotion && toolEntered++ < 12 && toolSummary) animateToolSummary(toolSummary);
+        if (animate && atBottom && !suppressHydrationMotion && !suppressWidthReflowMotion && toolEntered++ < 12 && summary) animateSummary(summary);
+      }
+      const runSummaryBox = runSummary?.getBoundingClientRect();
+      if (pendingRunSummaries.has(id) && runSummaryBox && runSummaryBox.width > 0 && runSummaryBox.height > 0) {
+        pendingRunSummaries.delete(id);
+        // MergedSteps already owns the label's fade/rise. Count its completed
+        // state as a logical arrival only for viewport lead, avoiding a second
+        // animation on the same DOM subtree.
+        if (animate && atBottom && !suppressHydrationMotion && !suppressWidthReflowMotion && toolEntered < 12) toolEntered++;
       }
     }
     const currentIds = new Set(rows.map((row) => row.getAttribute("data-history-row-id")).filter((id): id is string => Boolean(id)));
     for (const id of pending) if (!atBottom || !currentIds.has(id)) pending.delete(id);
     for (const id of pendingTools) if (!atBottom || !currentIds.has(id)) pendingTools.delete(id);
+    for (const id of pendingRunSummaries) if (!atBottom || !currentIds.has(id)) pendingRunSummaries.delete(id);
     while (seen.size > 5000) seen.delete(seen.values().next().value!);
 
     let compensatedScrollTop = chat.scrollTop;
-    // Completion details are a sibling of the timeline, so the whole content
-    // surface must rise when either messages, tools, or the footer add height.
+    // Measure the whole content surface so footer height participates in the
+    // viewport delta. contentRise translates only the timeline, leaving the
+    // Working/Worked footer at its laid-out bottom position.
     const riseSurface = chat.querySelector(CHAT_CONTENT) ?? chat.querySelector(CHAT_TIMELINE) ?? rows[0]?.parentElement ?? null;
     const suppressDisclosureRise = Date.now() < (chatDisclosureQuietUntil.get(chat) ?? 0);
     let toolLeadUntil = toolEntered > 0 ? Date.now() + 120 : old?.toolLeadUntil ?? 0;
-    // animateEntry writes transform-origin, which produces a second mutation.
-    // Keep ownership with the bubble for its full entrance so that mutation
-    // cannot replay the same height delta as a parent timeline rise.
-    const entryQuietUntil = entered > 0 ? Date.now() + 340 : old?.entryQuietUntil ?? 0;
-    const entryOwnsMotion = Date.now() < entryQuietUntil;
-    if (old && animate && riseSurface && atBottom && !reduced.matches && !entryOwnsMotion && !suppressHydrationMotion && !suppressWidthReflowMotion && !suppressDisclosureRise) {
+    if (old && animate && riseSurface && atBottom && !reduced.matches && !suppressHydrationMotion && !suppressWidthReflowMotion && !suppressDisclosureRise) {
       const wasFollowing = old.maxScrollTop - old.scrollTop < 180;
       const anticipatesHostFollow = wasFollowing && maxScrollTop > old.maxScrollTop && chat.scrollTop <= old.compensatedScrollTop + 0.5;
       if (anticipatesHostFollow) compensatedScrollTop = maxScrollTop;
+      else if (wasFollowing && maxScrollTop >= old.maxScrollTop && old.compensatedScrollTop > chat.scrollTop + 0.5) {
+        // ResizeObserver can run again before Paseo's next-frame bottom follow.
+        // Keep the anticipated position authoritative so that pass does not
+        // retarget the inverse rise by the same distance and cancel it.
+        compensatedScrollTop = old.compensatedScrollTop;
+      }
       const layoutDistance = compensatedScrollTop - old.compensatedScrollTop;
       const applyToolLead = Date.now() < toolLeadUntil && layoutDistance > 0.5;
       const distance = layoutDistance + (applyToolLead ? TOOL_SUMMARY_SCROLL_LEAD_PX : 0);
@@ -643,17 +689,19 @@ export function smoothStreamingText(enabled: () => boolean = () => true, subscri
       }
       if (anticipatesHostFollow) rise.prepare(distance);
       else rise.start(distance);
-    } else if (entryOwnsMotion || suppressHydrationMotion || suppressWidthReflowMotion || suppressDisclosureRise) chatRises.get(chat)?.cancel();
+    } else if (suppressHydrationMotion || suppressWidthReflowMotion || suppressDisclosureRise) chatRises.get(chat)?.cancel();
     chatStates.set(chat, {
       seen,
+      seenRecapRows,
+      seenRunSummaryRows,
       pending,
       pendingTools,
+      pendingRunSummaries,
       running,
       scrollTop: chat.scrollTop,
       compensatedScrollTop,
       maxScrollTop,
       clientWidth: chat.clientWidth,
-      entryQuietUntil,
       toolLeadUntil,
       hydrationQuietUntil,
       reflowQuietUntil,

@@ -77,7 +77,7 @@ interface StreamFadeValue {
 const EMPTY_CHUNKS: StreamFadeChunk[] = [];
 const StreamFadeContext = createContext<StreamFadeValue | null>(null);
 
-function StreamWordFade({
+export function StreamWordFade({
   text, enabled, children,
 }: {
   text: string; enabled: boolean; children: ReactNode;
@@ -112,7 +112,7 @@ function StreamWordFade({
   return <StreamFadeContext.Provider value={value}>{children}</StreamFadeContext.Provider>;
 }
 
-function StreamFadeText({ content }: { content: string }): ReactNode {
+export function StreamFadeText({ content }: { content: string }): ReactNode {
   const fade = useContext(StreamFadeContext);
   if (!fade || fade.chunks.length === 0 || content.length === 0) return content;
   const found = fade.source.indexOf(content, fade.cursor.current);
