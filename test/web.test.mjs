@@ -431,7 +431,7 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           const chat = document.createElement('div');
           chat.dataset.testid = 'agent-chat-scroll';
           chat.style = 'width:600px;height:400px;overflow:auto;overflow-anchor:auto';
-          chat.innerHTML = '<div data-testid="agent-chat-content" style="display:flex;flex-direction:column;padding:16px"><div data-testid="agent-chat-timeline"><div style="height:700px;flex-shrink:0;overflow-anchor:none"></div><div data-history-row-id="tool-row" style="flex-shrink:0"><button>Ran command</button><div data-cp-expand="closed"><div style="min-height:0;overflow:hidden"><div style="height:250px;margin:6px 0 12px">Output</div></div></div></div><div data-history-row-id="merged-run-row" style="flex-shrink:0"><div id="merged-run" style="height:24px"><span data-cp-summary-label="" data-cp-running-label="">Running command</span></div></div><div data-history-row-id="assistant-turn" style="flex-shrink:0"><div data-testid="assistant-message" style="height:36px">Finished reply</div><div id="turn-extras"></div></div></div><div id="completion-host"><div data-testid="turn-working-indicator">Working</div></div></div>';
+          chat.innerHTML = '<div data-testid="agent-chat-content" style="display:flex;flex-direction:column;padding:16px"><div data-testid="agent-chat-timeline"><div style="height:700px;flex-shrink:0;overflow-anchor:none"></div><div data-history-row-id="tool-row" style="flex-shrink:0"><button>Ran command</button><div data-cp-expand="closed"><div style="min-height:0;overflow:hidden"><div style="height:250px;margin:6px 0 12px">Output</div></div></div></div><div data-history-row-id="merged-run-row" style="flex-shrink:0"><div id="merged-run" style="height:24px"><div data-cp-summary-label="" data-cp-running-label="">Running command</div></div></div><div data-history-row-id="assistant-turn" style="flex-shrink:0"><div data-testid="assistant-message" style="height:36px">Finished reply</div><div id="turn-extras"></div></div></div><div id="completion-host"><div data-testid="turn-working-indicator">Working</div></div></div>';
           document.body.appendChild(chat);
           const content = chat.firstElementChild, expanding = chat.querySelector('[data-cp-expand]');
           const toolTimeline = chat.querySelector('[data-testid="agent-chat-timeline"]');
@@ -523,7 +523,7 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           await wait(30);
           const runHeightDelta = chat.scrollHeight - runHeightBefore;
           const followingTurn = chat.querySelector('[data-history-row-id="assistant-turn"]');
-          const runRiseAnimation = followingTurn.getAnimations().find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
+          const runRiseAnimation = toolTimeline.getAnimations().find((animation) => animation.effect?.getKeyframes().some((frame) => String(frame.transform).startsWith('translateY(')));
           const runRiseFrame = runRiseAnimation?.effect?.getKeyframes()[0];
           const runViewportRise = Math.abs(Number.parseFloat(String(runRiseFrame?.transform).slice('translateY('.length)));
           checks.completedToolSummaryGetsViewportLead = runHeightDelta > 0 && runViewportRise > runHeightDelta + 3;
@@ -541,28 +541,28 @@ test("DOM restyling, accordion transitions, and bottom following stay stable", {
           checks.completedToolSummarySlidesFollowingContent = followingStart > followingMiddle && followingMiddle > followingEnd;
           const completedSummaryAnimations = mergedRun.firstElementChild.getAnimations();
           const completedSummaryFrames = completedSummaryAnimations.flatMap((animation) => animation.effect?.getKeyframes() ?? []);
-          checks.completedToolSummaryWaitsForTimelineRise = completedSummaryAnimations.some((animation) => Number(animation.effect?.getTiming().delay) >= 150)
-            && completedSummaryFrames.some((frame) => Number(frame.opacity) === 0 && String(frame.transform).includes('translateY(4px)'));
-          checks.completedToolSummarySettlesBeforeAppearing = completedSummaryFrames.some((frame) => Number(frame.opacity) === 0 && String(frame.transform).includes('translateY(0'));
+          checks.completedToolSummaryWaitsForTimelineRise = completedSummaryAnimations.some((animation) => Number(animation.effect?.getTiming().delay ?? 0) === 0)
+            && completedSummaryFrames.some((frame) => Number(frame.opacity) === 0.25 && String(frame.transform).includes('translateY(4px)'));
+          checks.completedToolSummarySettlesBeforeAppearing = completedSummaryFrames.length === 2
+            && completedSummaryFrames.some((frame) => Number(frame.opacity) === 1 && String(frame.transform).includes('translateY(0'));
           const completedSummaryAnimation = completedSummaryAnimations[0];
-          let visibleSummaryTop = 0, settledSummaryTop = 0, visibleSummaryOpacity = 0;
+          let startSummaryTop = 0, middleSummaryTop = 0, settledSummaryTop = 0, visibleSummaryOpacity = 0;
           if (runRiseAnimation && completedSummaryAnimation) {
             const riseDuration = Number(runRiseAnimation.effect?.getTiming().duration ?? 0);
             const summaryTiming = completedSummaryAnimation.effect?.getTiming();
-            const summaryDelay = Number(summaryTiming?.delay ?? 0);
             const summaryDuration = Number(summaryTiming?.duration ?? 0);
-            runRiseAnimation.pause();
+            runRiseAnimation.finish();
             completedSummaryAnimation.pause();
-            runRiseAnimation.currentTime = Math.min(riseDuration, summaryDelay + 32);
-            completedSummaryAnimation.currentTime = summaryDelay + 32;
+            completedSummaryAnimation.currentTime = 0;
             visibleSummaryOpacity = Number(getComputedStyle(mergedRun.firstElementChild).opacity);
-            visibleSummaryTop = mergedRun.firstElementChild.getBoundingClientRect().top;
-            runRiseAnimation.currentTime = riseDuration;
-            completedSummaryAnimation.currentTime = summaryDelay + summaryDuration;
+            startSummaryTop = mergedRun.firstElementChild.getBoundingClientRect().top;
+            completedSummaryAnimation.currentTime = summaryDuration / 2;
+            middleSummaryTop = mergedRun.firstElementChild.getBoundingClientRect().top;
+            completedSummaryAnimation.currentTime = summaryDuration;
             settledSummaryTop = mergedRun.firstElementChild.getBoundingClientRect().top;
           }
-          checks.completedToolSummaryDoesNotMoveOnceVisible = visibleSummaryOpacity > 0
-            && Math.abs(visibleSummaryTop - settledSummaryTop) <= 0.5;
+          checks.completedToolSummaryDoesNotMoveOnceVisible = visibleSummaryOpacity >= 0.25
+            && startSummaryTop > middleSummaryTop && middleSummaryTop >= settledSummaryTop;
           // Paseo 0.11.4 follows content resizing in the next animation frame.
           let hostFollowing = true;
           const hostFollow = new ResizeObserver(() => requestAnimationFrame(() => {

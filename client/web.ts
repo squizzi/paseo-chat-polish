@@ -637,13 +637,25 @@ export function installChatMotion(enabled: () => boolean = () => true, subscribe
     const originalOverflow = clipOwner?.style.getPropertyValue("overflow") ?? "";
     if (clipOwner) clipOwner.style.setProperty("overflow", "clip");
     // Let the timeline begin moving first, then reveal the words into the
-    // space it made. The icon and details stay outside this animation,
-    // preserving disclosure and status motion.
-    const animation = line.animate([
-      { opacity: 0, transform: "translateY(4px)" },
-      { offset: 0.25, opacity: 0, transform: "translateY(0)" },
-      { opacity: 1, transform: "translateY(0)" },
-    ], { duration: 240, delay: TOOL_SUMMARY_ENTRY_DELAY_MS, easing: "cubic-bezier(0.23, 1, 0.32, 1)", fill: "both" });
+    // space it made. Completed merged runs ease up immediately the same way
+    // live step swaps on that line do. The icon and details stay outside
+    // this animation, preserving disclosure and status motion.
+    const frames: Record<string, string | number>[] = completedRun
+      ? [
+          { opacity: 0.25, transform: "translateY(4px)" },
+          { opacity: 1, transform: "translateY(0)" },
+        ]
+      : [
+          { opacity: 0, transform: "translateY(4px)" },
+          { offset: 0.25, opacity: 0, transform: "translateY(0)" },
+          { opacity: 1, transform: "translateY(0)" },
+        ];
+    const animation = line.animate(frames, {
+      duration: 240,
+      delay: completedRun ? 0 : TOOL_SUMMARY_ENTRY_DELAY_MS,
+      easing: "cubic-bezier(0.23, 1, 0.32, 1)",
+      fill: "both",
+    });
     const restoreOverflow = () => {
       if (!clipOwner) return;
       if (originalOverflow) clipOwner.style.setProperty("overflow", originalOverflow);
@@ -780,9 +792,8 @@ export function installChatMotion(enabled: () => boolean = () => true, subscribe
         pendingRunSummaries.delete(id);
         if (animate && atBottom && !suppressHydrationMotion && !suppressWidthReflowMotion && toolEntered < 12) {
           toolEntered++;
-          animateSummary(runSummary);
-          stationaryTargets.add(runSummary);
-          arrivalRows.set(id, Date.now() + 220);
+          const summaryLabel = runSummary.querySelector('[data-cp-summary-label]') ?? runSummary;
+          if (!summaryLabel.style.getPropertyValue("transform")) animateSummary(runSummary);
         }
       }
     }
@@ -795,9 +806,7 @@ export function installChatMotion(enabled: () => boolean = () => true, subscribe
     for (const row of rows) {
       const id = row.getAttribute("data-history-row-id");
       if (!id || !arrivalRows.has(id)) continue;
-      const activeRunSummary = row.querySelector(RUN_SUMMARY);
-      if (activeRunSummary) stationaryTargets.add(activeRunSummary);
-      else if (row === bottomRow) stationaryTargets.add(row);
+      if (row === bottomRow) stationaryTargets.add(row);
     }
     while (seen.size > 5000) seen.delete(seen.values().next().value!);
     while (seenToolSummaryRows.size > 5000) seenToolSummaryRows.delete(seenToolSummaryRows.values().next().value!);

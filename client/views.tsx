@@ -635,7 +635,7 @@ export function MergedSteps(
         meta={failed ? `${failed} failed` : live ? `${steps.length} steps` : ms ? duration(ms) : undefined}
         metaColor={failed ? c.statusDanger : undefined}
         pulsing={!!live}
-        swap={!!live || Platform.OS !== "web"}
+        swap
         summary
         open={open}
         onToggle={toggle}
